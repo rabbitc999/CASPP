@@ -1,0 +1,9 @@
+# 构建产物
+build/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
