@@ -47,6 +47,11 @@ public:
         m_position = 0;
     }
 
+    Parser(const std::string &text, const ParseOptions &options, bool allowUnknownCalls = false)
+        : m_text(text), m_allowUnknownCalls(allowUnknownCalls), m_options(options) {
+        m_position = 0;
+    }
+
     /** @brief 解析整个表达式。 */
     ParseResult run() {
         ParseResult result;
@@ -568,8 +573,36 @@ private:
         // 小写 `i` 是普通变量（求和下标等场景大量使用，不能被偷换）。
         if (name == "I") return Ptr(Node::makeSymbol("I"));
 
-        // 函数调用
-        if (m_token.kind == TokenKind::LeftParen && isFunctionName(name)) {
+        // `define(f(x), ...)`：第一个参数是"函数签名"，需要按调用解析。
+        // 这个开关只在这个括号内打开，不影响后续参数与其它位置。
+        // 必须放在通用函数调用分支之前，否则会被 builtin 分支按普通参数解析。
+        if (m_options.allowSignature && m_token.kind == TokenKind::LeftParen &&
+            (name == "define" || name == "let")) {
+            advance();
+            ++m_signatureDepth;
+            Ptr signature = parseAssignment();
+            --m_signatureDepth;
+            if (!signature) return Ptr();
+            Memory::Vector<Ptr> arguments{signature};
+            while (m_token.kind == TokenKind::Operator && m_token.text == ",") {
+                advance();
+                Ptr argument = parseAssignment();
+                if (!argument) return Ptr();
+                arguments.push_back(argument);
+            }
+            if (m_token.kind != TokenKind::RightParen) {
+                fail("define 缺少右括号");
+                return Ptr();
+            }
+            advance();
+            Memory::Vector<NodePtr> raw;
+            raw.reserve(arguments.size());
+            for (const Ptr &argument : arguments) raw.push_back(argument.get());
+            return Ptr(Node::makeFunction("define", raw));
+        }
+
+        // 函数调用：内置名字，或用户已登记的定义名（`f(2)` 不再读作 f 乘 2）
+        if (m_token.kind == TokenKind::LeftParen && (isFunctionName(name) || isUserFunction(name))) {
             advance();
             Memory::Vector<Ptr> arguments;
             if (m_token.kind != TokenKind::RightParen) {
@@ -604,9 +637,12 @@ private:
             return Ptr(Node::makeFunction(canonical, raw));
         }
 
-        // 未知函数调用：仅初值条件这类场景需要（`y(0)` 是"函数在 0 点取值"，
-        // 而不是 y 乘 0）。默认关闭，避免 `x(1)` 这类写法被误读成函数。
-        if (m_allowUnknownCalls && m_token.kind == TokenKind::LeftParen) {
+        // 未知函数调用：仅初值条件、define 签名这类场景需要（`y(0)` 是"函数在 0 点取值"，
+        // `f(x)` 在 define 的第一个参数里是"函数签名"，而不是 y 乘 0 / f 乘 x）。
+        // 默认关闭，避免 `x(1)` 这类写法被误读成函数。
+        if ((m_allowUnknownCalls || m_options.allowAnyCall ||
+             (m_options.allowSignature && m_signatureDepth > 0)) &&
+            m_token.kind == TokenKind::LeftParen) {
             advance();
             Memory::Vector<Ptr> arguments;
             if (m_token.kind != TokenKind::RightParen) {
@@ -645,6 +681,8 @@ private:
             "factorial", "gamma", "max", "min", "gcd", "lcm",
             // 命令名：让 `expand((x+1)^3)` 走函数调用而不是当成 expand*(x+1)^3
             "simplify", "simp", "expand", "factor", "together", "trigsimp", "trigs",
+            "subs", "substitute", "replace", "eval",
+            "define", "let", "undef", "undefine", "forget", "defs", "definitions",
             "latex", "diff", "differentiate", "derivative", "integrate", "int", "integral",
             "limit", "lim", "taylor", "series", "solve", "groebner", "gb", "resultant", "res",
             "critical", "extremum", "criticalpoints",
@@ -668,8 +706,18 @@ private:
         return false;
     }
 
+    /** @brief 名字是否是用户已登记的定义函数（由解析选项提供判据）。 */
+    bool isUserFunction(const std::string &name) const {
+        if (!m_options.isUserFunction) return false;
+        return m_options.isUserFunction(name);
+    }
+
     const std::string &m_text;
     bool m_allowUnknownCalls = false;
+    /** @brief 用户定义相关的解析选项。 */
+    ParseOptions m_options;
+    /** @brief 正在解析 define 的签名参数（>0 时裸符号+括号按调用解析）。 */
+    int m_signatureDepth = 0;
     std::size_t m_position = 0;
     Token m_token;
     std::string m_error;
@@ -708,6 +756,11 @@ bool startsWithOdeCommand(const std::string &text) {
 
 ParseResult parseExpression(const std::string &text) {
     Parser parser(text, startsWithOdeCommand(text));
+    return parser.run();
+}
+
+ParseResult parseExpression(const std::string &text, const ParseOptions &options) {
+    Parser parser(text, options, startsWithOdeCommand(text));
     return parser.run();
 }
 

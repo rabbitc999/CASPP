@@ -32,6 +32,8 @@
 
 #include "cas/detail/simplify.h"
 
+#include <functional>
+
 namespace Cas::Detail {
 
 /** @brief 解析结果与诊断信息。 */
@@ -43,8 +45,30 @@ struct ParseResult {
     std::size_t length = 0;       ///< 表达式消耗的字符数
 };
 
+/**
+ * @brief 解析选项。
+ *
+ * 缺省行为是「只有内置名字后跟括号才算函数调用，其余按隐式乘法」，
+ * 这样 `f(x)` 仍读作 `f` 乘 `x`。接入用户定义后需要用 `isUserFunction`
+ * 把已登记的名字标出来，它们在 `name(...)` 位置才按调用解析。
+ */
+struct ParseOptions {
+    /** @brief 判断某个名字是否为用户定义的函数（返回 true 时 `name(...)` 按调用解析）。 */
+    std::function<bool(const std::string &)> isUserFunction;
+    /** @brief 是否把 `define`/`let` 的第一个参数整体当作函数签名解析。 */
+    bool allowSignature = false;
+    /**
+     * @brief 允许任意裸符号后跟括号按调用解析。
+     *
+     * `define` 解析签名时用：此时还不存在定义，无法靠 `isUserFunction` 判断。
+     */
+    bool allowAnyCall = false;
+};
+
 /** @brief 解析单个表达式。 */
 ParseResult parseExpression(const std::string &text);
+/** @brief 带选项解析单个表达式。 */
+ParseResult parseExpression(const std::string &text, const ParseOptions &options);
 
 /**
  * @brief 解析一条初值条件，如 `y(0) = 1`、`y'(0) = 0`。

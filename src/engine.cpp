@@ -305,6 +305,371 @@ Result Engine::trigSimplify(const std::string &expression) {
     return result;
 }
 
+/* ------------------------------------------------------------ 变量替换 */
+
+Result Engine::substitute(const std::string &expression, const std::string &variable, const std::string &value) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+
+    const ParseResult body = parseExpression(expression);
+    if (!body.ok) return makeError(body.message, body.position);
+
+    // 变量与代入值都可以是列表：subs(expr, [x, y], [1, 2])
+    const ParseResult variableNode = parseExpression(variable);
+    if (!variableNode.ok) return makeError("无法解析被替换的变量：" + variableNode.message, variableNode.position);
+    const ParseResult valueNode = parseExpression(value);
+    if (!valueNode.ok) return makeError("无法解析代入值：" + valueNode.message, valueNode.position);
+
+    Ptr current = body.expression;
+    if (isListNode(variableNode.expression)) {
+        if (!isListNode(valueNode.expression)) {
+            return makeError("变量是列表时，代入值也必须是同长度的列表");
+        }
+        const std::size_t count = variableNode.expression->size();
+        if (valueNode.expression->size() != count) {
+            return makeError("变量列表与代入值列表长度不一致");
+        }
+        // 同时替换多个变量：先各自替换再统一化简，避免中间结果反复化简引入误差
+        Memory::Vector<Ptr> holders;
+        for (std::size_t index = 0; index < count; ++index) {
+            const Ptr name = Ptr::borrow(variableNode.expression->operand(index));
+            if (name->kind() != NodeKind::Symbol || !name->name()) {
+                return makeError("变量列表里只能是符号，如 [x, y]");
+            }
+            const Ptr replacement = Ptr::borrow(valueNode.expression->operand(index));
+            Ptr replaced = Detail::substitute(current, name->symbolId(), replacement);
+            if (!replaced) return makeError("替换失败：表达式结构异常");
+            holders.push_back(replaced);
+            current = replaced;
+        }
+        current = Detail::simplify(current);
+    } else {
+        if (variableNode.expression->kind() != NodeKind::Symbol || !variableNode.expression->name()) {
+            return makeError("被替换的目标必须是一个变量名，如 subs(x^2, x, 3)");
+        }
+        current = Detail::substitute(body.expression, variableNode.expression->symbolId(), valueNode.expression);
+        if (!current) return makeError("替换失败：表达式结构异常");
+        current = Detail::simplify(current);
+    }
+
+    if (!current) return makeError("替换结果为空");
+    result = makeResult(current, m_unicodeOutput);
+    if (result.ok) m_lastResult = result.text;
+    return result;
+}
+
+/* ------------------------------------------------------------ 用户定义 */
+
+Detail::ParseOptions Engine::parseOptions() const {
+    Detail::ParseOptions options;
+    options.allowSignature = true;
+    const std::vector<Definition> *table = &m_definitions;
+    options.isUserFunction = [table](const std::string &name) {
+        for (const Definition &definition : *table) {
+            // 只有带形参的定义才允许 `name(...)` 写法；常量定义不参与
+            if (definition.name == name && !definition.parameters.empty()) return true;
+        }
+        return false;
+    };
+    return options;
+}
+
+Detail::ParseResult Engine::parse(const std::string &text) const {
+    return Detail::parseExpression(text, parseOptions());
+}
+
+namespace {
+
+/** @brief 名字是否可用作用户定义（不能覆盖内置命令与函数）。 */
+bool isReservedName(const std::string &name) {
+    static const char *const kReserved[] = {
+        "sin", "cos", "tan", "cot", "sec", "csc", "asin", "acos", "atan", "acot",
+        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+        "exp", "log", "ln", "sqrt", "cbrt", "abs", "sign", "floor", "ceil", "round",
+        "simplify", "simp", "expand", "factor", "together", "trigsimp", "trigs",
+        "subs", "substitute", "replace", "eval", "define", "undef", "defs",
+        "latex", "diff", "differentiate", "derivative", "integrate", "int", "integral",
+        "limit", "lim", "taylor", "series", "solve", "groebner", "gb", "resultant", "res",
+        "critical", "extremum", "criticalpoints", "list", "equal", "range",
+        "sum", "summation", "converge", "converges", "bernoulli", "guess",
+        "det", "determinant", "inv", "inverse", "invert", "transpose", "trans", "trace", "tr",
+        "matmul", "dot", "rank", "rref", "charpoly", "eigenvals", "eigenvalues", "identity", "eye",
+        "dsolve", "ode", "odeclassify", "pi", "e", "oo", "inf", "infinity", "I",
+    };
+    for (const char *candidate : kReserved) {
+        if (name == candidate) return true;
+    }
+    return false;
+}
+
+/** @brief 表达式树里是否出现该名字（符号名、函数名或形参名）。 */
+bool containsName(const Detail::NodePtr &node, const std::string &name) {
+    if (!node) return false;
+    if (node->kind() == NodeKind::Symbol && node->name() && name == node->name()) return true;
+    if (node->kind() == NodeKind::Function && node->name() && name == node->name()) return true;
+    const std::size_t count = node->size();
+    for (std::size_t index = 0; index < count; ++index) {
+        if (containsName(node->operand(index), name)) return true;
+    }
+    // 函数节点的形参也可能藏在名字里？不需要：形参是子节点，已被上面递归覆盖
+    return false;
+}
+
+} // namespace
+
+Result Engine::define(const std::string &signature, const std::string &body) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+
+    const std::string left = trim(signature);
+    if (left.empty()) return makeError("define 需要一个函数签名或常量名，如 define(f(x), x^2+1)");
+
+    Definition definition;
+    // 签名解析需要「裸符号+括号 = 调用」：此时定义还不存在，无从查表
+    Detail::ParseOptions signatureOptions = parseOptions();
+    signatureOptions.allowAnyCall = true;
+    const ParseResult parsedSignature = Detail::parseExpression(left, signatureOptions);
+
+    if (parsedSignature.ok && parsedSignature.expression->kind() == NodeKind::Function) {
+        // 函数定义：f(x) / f(x, y)
+        definition.name = functionName(parsedSignature.expression.get());
+        if (definition.name.empty()) return makeError("无法识别函数名");
+        for (std::size_t index = 0; index < parsedSignature.expression->size(); ++index) {
+            const Ptr parameter = Ptr::borrow(parsedSignature.expression->operand(index));
+            if (parameter->kind() != NodeKind::Symbol || !parameter->name()) {
+                return makeError("函数形参只能是符号，如 define(f(x, y), x+y)");
+            }
+            definition.parameters.push_back(parameter->name());
+        }
+        // 形参不能重名
+        for (std::size_t i = 0; i < definition.parameters.size(); ++i) {
+            for (std::size_t j = i + 1; j < definition.parameters.size(); ++j) {
+                if (definition.parameters[i] == definition.parameters[j]) {
+                    return makeError("形参重名：" + definition.parameters[i]);
+                }
+            }
+        }
+    } else {
+        // 常量定义：define(a, 3)
+        if (left.find('(') != std::string::npos) {
+            return makeError("无法解析函数签名：" + (parsedSignature.ok ? std::string("不是函数调用")
+                                                                      : parsedSignature.message));
+        }
+        definition.name = left;
+    }
+
+    if (isReservedName(definition.name)) {
+        return makeError("名字 `" + definition.name + "` 已被内置函数或命令占用，请换一个");
+    }
+
+    // 定义体必须能解析；先化简一遍，便于检查
+    const ParseResult parsedBody = parseExpression(body);
+    if (!parsedBody.ok) return makeError("定义体无法解析：" + parsedBody.message, parsedBody.position);
+
+    // 自引用检查：定义体里出现自己的名字会让展开无限递归。
+    // 形参同名不算（`define(f(x), f(x))` 里第一个 f 是定义名，第二个才是自引用）。
+    if (containsName(parsedBody.expression.get(), definition.name)) {
+        return makeError("定义不能引用自身：`" + definition.name + "` 出现在定义体里");
+    }
+
+    definition.body = body;
+    bool replaced = false;
+    for (Definition &existing : m_definitions) {
+        if (existing.name == definition.name) {
+            existing = definition;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) m_definitions.push_back(definition);
+
+    std::string text;
+    if (definition.parameters.empty()) {
+        text = "已定义 " + definition.name + " = " + definition.body;
+    } else {
+        std::string parameters;
+        for (std::size_t index = 0; index < definition.parameters.size(); ++index) {
+            if (index) parameters += ", ";
+            parameters += definition.parameters[index];
+        }
+        text = "已定义 " + definition.name + "(" + parameters + ") = " + definition.body;
+    }
+
+    result.ok = true;
+    result.text = text;
+    result.latex = "\\text{" + text + "}";
+    m_lastResult = result.text;
+    return result;
+}
+
+Result Engine::undefine(const std::string &name) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+    const std::string key = trim(name);
+    for (auto it = m_definitions.begin(); it != m_definitions.end(); ++it) {
+        if (it->name == key) {
+            m_definitions.erase(it);
+            result.ok = true;
+            result.text = "已删除定义 " + key;
+            result.latex = "\\text{" + result.text + "}";
+            m_lastResult = result.text;
+            return result;
+        }
+    }
+    return makeError("没有名为 `" + key + "` 的定义");
+}
+
+Result Engine::definitions() const {
+    Result result;
+    Timer timer(&result.elapsedMs);
+    if (m_definitions.empty()) {
+        result.ok = true;
+        result.text = "（没有定义）";
+        result.latex = "\\text{" + result.text + "}";
+        return result;
+    }
+    std::string text;
+    for (const Definition &definition : m_definitions) {
+        if (!text.empty()) text += "\n";
+        if (definition.parameters.empty()) {
+            text += definition.name + " = " + definition.body;
+        } else {
+            std::string parameters;
+            for (std::size_t index = 0; index < definition.parameters.size(); ++index) {
+                if (index) parameters += ", ";
+                parameters += definition.parameters[index];
+            }
+            text += definition.name + "(" + parameters + ") = " + definition.body;
+        }
+    }
+    result.ok = true;
+    result.text = text;
+    result.latex = "\\text{" + text + "}";
+    return result;
+}
+
+Result Engine::expandDefinition(const std::string &name, const Detail::Ptr &call) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+
+    const Definition *found = nullptr;
+    for (const Definition &definition : m_definitions) {
+        if (definition.name == name) {
+            found = &definition;
+            break;
+        }
+    }
+    if (!found) return makeError(""); // 空 message = 不是用户定义，交回调用方
+
+    const std::size_t given = call->size();
+    if (given != found->parameters.size()) {
+        return makeError("`" + name + "` 需要 " + std::to_string(found->parameters.size()) + " 个参数，实际给了 " +
+                         std::to_string(given) + " 个");
+    }
+
+    const ParseResult parsedBody = parse(found->body);
+    if (!parsedBody.ok) return makeError("定义体 `" + found->body + "` 无法解析：" + parsedBody.message);
+
+    Ptr current = parsedBody.expression;
+    for (std::size_t index = 0; index < given; ++index) {
+        const std::uint32_t id = internSymbol(found->parameters[index]);
+        const Ptr argument = Ptr::borrow(call->operand(index));
+        Ptr replaced = Detail::substitute(current, id, argument);
+        if (!replaced) return makeError("展开定义 `" + name + "` 时失败");
+        current = replaced;
+    }
+    current = Detail::simplify(current);
+    if (!current) return makeError("展开定义 `" + name + "` 后结果为空");
+
+    result = makeResult(current, m_unicodeOutput);
+    if (result.ok) m_lastResult = result.text;
+    return result;
+}
+
+bool Engine::foldDefinitions(const Detail::Ptr &node, std::string *out) {
+    if (!node || !out) return false;
+
+    // 用户定义的函数调用：直接换成定义体代入后的文本
+    if (node->kind() == NodeKind::Function && node->name() && *node->name() != '\0') {
+        const std::string name = node->name();
+        for (const Definition &definition : m_definitions) {
+            if (definition.name != name || definition.parameters.size() != node->size()) continue;
+            const ParseResult parsedBody = parse(definition.body);
+            if (!parsedBody.ok) return false;
+            Ptr current = parsedBody.expression;
+            for (std::size_t index = 0; index < node->size(); ++index) {
+                std::uint32_t id = internSymbol(definition.parameters[index]);
+                Ptr replaced = Detail::substitute(current, id, Ptr::borrow(node->operand(index)));
+                if (!replaced) return false;
+                current = replaced;
+            }
+            *out = render(current);
+            return true;
+        }
+    }
+
+    // 常量定义的符号替换：`define(a, 3)` 之后 `a+1` 里的 `a` 换成 `3`
+    if (node->kind() == NodeKind::Symbol && node->name()) {
+        const std::string symbol = node->name();
+        for (const Definition &definition : m_definitions) {
+            if (definition.name != symbol || !definition.parameters.empty()) continue;
+            *out = "(" + definition.body + ")";
+            return true;
+        }
+        return false;
+    }
+
+    // 非函数节点：递归子项，任一子项被替换就按运算符拼回去
+    const std::size_t count = node->size();
+    if (count == 0) return false;
+    Memory::Vector<std::string> rewritten;
+    bool changed = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::string piece;
+        if (foldDefinitions(Ptr::borrow(node->operand(i)), &piece)) {
+            rewritten.push_back(piece);
+            changed = true;
+        } else {
+            rewritten.push_back(render(Ptr::borrow(node->operand(i))));
+        }
+    }
+    if (!changed) return false;
+
+    switch (node->kind()) {
+    case NodeKind::Add:
+    case NodeKind::Mul: {
+        const char *op = node->kind() == NodeKind::Add ? " + " : "*";
+        std::string built;
+        for (std::size_t i = 0; i < rewritten.size(); ++i) {
+            if (i > 0) built += op;
+            built += "(" + rewritten[i] + ")";
+        }
+        *out = built;
+        return true;
+    }
+    case NodeKind::Pow: {
+        if (rewritten.size() != 2) return false;
+        *out = "(" + rewritten[0] + ")^(" + rewritten[1] + ")";
+        return true;
+    }
+    case NodeKind::Function: {
+        // 命令调用：把被替换过的子项拼回 `name(arg1, arg2)`
+        if (!node->name()) return false;
+        std::string built = node->name();
+        built += "(";
+        for (std::size_t i = 0; i < rewritten.size(); ++i) {
+            if (i > 0) built += ", ";
+            built += rewritten[i];
+        }
+        built += ")";
+        *out = built;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 /* ------------------------------------------------------------ 微积分 */
 
 namespace {
@@ -886,13 +1251,37 @@ Result Engine::evaluate(const std::string &input) {
     if (text.empty()) return makeError("输入为空");
 
     // 先按纯表达式解析；顶层是 `name(...)` 且 name 是命令时直接分发
-    const ParseResult parsed = parseExpression(text);
+    const ParseResult parsed = parse(text);
     if (parsed.ok) {
+        const std::string topName =
+            parsed.expression->kind() == NodeKind::Function ? functionName(parsed.expression.get()) : std::string();
+
+        // 定义相关命令本身不能被折叠（否则 `define(f(x), ...)` 会被当成调用 f）
+        const bool isDefinitionCommand = topName == "define" || topName == "let" || topName == "undef" ||
+                                         topName == "undefine" || topName == "forget" || topName == "defs" ||
+                                         topName == "definitions";
+
+        // 先把用户定义折叠成普通表达式：这样后续化简/求导/积分/求解都无需感知定义表。
+        // 顶层命令也一样处理，否则 `diff(f(x), x)` 会把未展开的 f(x) 交给求导。
+        // `m_foldDepth` 防止 `define(a, a+1)` 这类自引用定义无限递归。
+        if (!isDefinitionCommand && m_foldDepth < 8) {
+            std::string folded;
+            if (foldDefinitions(parsed.expression, &folded) && folded != text) {
+                ++m_foldDepth;
+                Result foldedResult = evaluate(folded);
+                --m_foldDepth;
+                return foldedResult;
+            }
+        }
+
         // 顶层命令无条件分发：命令名本身就是语法，不需要额外识别
         if (parsed.expression->kind() == NodeKind::Function && parsed.expression->size() >= 1) {
             Result dispatched = dispatch(functionName(parsed.expression.get()), parsed.expression.get(), text);
             // dispatch 只在"不认识这个函数名"时返回空 message 且 ok=false
             if (dispatched.ok || !dispatched.message.empty()) return dispatched;
+            // 不是内置命令：可能是用户定义的函数，查表展开
+            Result expanded = expandDefinition(functionName(parsed.expression.get()), parsed.expression);
+            if (expanded.ok || !expanded.message.empty()) return expanded;
         }
         // 内层也可能有矩阵命令：det(inv(A))、matmul(A,B) 等
         std::string rewritten;
@@ -928,6 +1317,11 @@ Result Engine::evaluate(const std::string &input) {
         }
         Result simplified;
         Timer timer(&simplified.elapsedMs);
+        // 无参命令（`defs`、`mem` 之类）被解析成裸符号，这里单独接一下
+        if (parsed.expression->kind() == NodeKind::Symbol && parsed.expression->name()) {
+            const std::string bare = parsed.expression->name();
+            if (bare == "defs" || bare == "definitions") return definitions();
+        }
         // 先做三角/特殊角折叠，再做通用化简；三角化简失败时回退到纯代数化简
         Ptr value = Detail::trigSimplify(parsed.expression);
         if (!value) value = Detail::simplify(parsed.expression);
@@ -949,6 +1343,10 @@ std::string Engine::helpText() {
     return
         "命令（变量默认 x，可省略）：\n"
         "  simplify(expr)              化简\n"
+        "  subs(expr, x, 3)            变量替换（x 也可传 [x, y]，值传 [1, 2]）\n"
+        "  define(f(x), x^2+1)         定义函数，之后 f(2) → 5；define(a, 3) 定义常量\n"
+        "  defs                        列出全部定义\n"
+        "  undef(f)                    删除定义\n"
         "  expand(expr)                展开\n"
         "  factor(expr)                因式分解\n"
         "  together(expr)              通分\n"
@@ -1019,6 +1417,19 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
     auto text = [&argument](std::size_t index) { return render(argument(index)); };
 
     if (name == "simplify" || name == "simp") return simplify(text(0));
+    if (name == "define" || name == "let") {
+        if (count < 2) return makeError("用法：define(f(x), x^2+1) 或 define(a, 3)");
+        return define(text(0), text(1));
+    }
+    if (name == "undef" || name == "undefine" || name == "forget") {
+        if (count < 1) return makeError("用法：undef(f)");
+        return undefine(text(0));
+    }
+    if (name == "defs" || name == "definitions") return definitions();
+    if (name == "subs" || name == "substitute" || name == "replace" || name == "eval") {
+        if (count < 3) return makeError("用法：subs(expr, x, 3) 或 subs(expr, [x, y], [1, 2])");
+        return substitute(text(0), text(1), text(2));
+    }
     if (name == "specialsimplify" || name == "specialsimp" || name == "spsimp") {
         const ParseResult parsed = parseExpression(text(0));
         if (!parsed.ok) return makeError(parsed.message, parsed.position);

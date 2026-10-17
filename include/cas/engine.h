@@ -23,6 +23,7 @@
  */
 
 #include "cas/allocator.h"
+#include "cas/detail/parser.h"
 #include "cas/memory.h"
 
 #include <cstddef>
@@ -75,6 +76,32 @@ public:
     /** @brief 定积分；上下限可为 `0`、`pi`、`oo` 等表达式。 */
     Result integrateDefinite(const std::string &expression, const std::string &lower, const std::string &upper,
                              const std::string &variable = "x");
+    /**
+     * @brief 变量替换：`subs(x^2+1, x, 3)`。
+     *
+     * @param expression 待替换的表达式。
+     * @param variable   被替换的变量名（也可传 `[x, y]` 这样的列表，配合 `replacements` 列表）。
+     * @param value      代入值（或与变量列表等长的值列表）。
+     * @return 替换并化简后的结果。
+     */
+    Result substitute(const std::string &expression, const std::string &variable, const std::string &value);
+
+    /**
+     * @brief 定义函数或常量。
+     *
+     * - `define(f(x), x^2+1)` 定义单参函数，之后 `f(2)` 求值得 `5`；
+     * - `define(f(x, y), x+y)` 定义多参函数；
+     * - `define(a, 3)` 定义符号常量，之后 `a+1` 得 `4`；
+     * - 同名重复定义会覆盖，`undef(f)` 删除。
+     *
+     * @param signature 函数签名（`f(x)`、`f(x, y)`）或常量名（`a`）。
+     * @param body      函数体 / 常量值。
+     */
+    Result define(const std::string &signature, const std::string &body);
+    /** @brief 删除定义；返回是否确实存在。 */
+    Result undefine(const std::string &name);
+    /** @brief 列出全部定义（`defs` 命令）。 */
+    Result definitions() const;
     Result limit(const std::string &expression, const std::string &point, const std::string &variable = "x");
     Result taylor(const std::string &expression, const std::string &point, int order,
                   const std::string &variable = "x");
@@ -156,8 +183,36 @@ private:
     /** @brief `converge(term, i=a..oo)` 的实现：判定级数敛散性。 */
     Result convergeCommand(const Detail::Ptr &term, const Detail::Ptr &range);
 
+    /** @brief 用户定义：签名 `f(x, y)` 或常量 `a` → 定义体文本。 */
+    struct Definition {
+        std::string name;                  ///< 函数名 / 常量名
+        std::vector<std::string> parameters; ///< 形参；常量定义时为空
+        std::string body;                  ///< 定义体文本
+    };
+
+    /** @brief 查表并展开定义：把 `f(2)` 替换成 `2^2+1` 再化简。 */
+    Result expandDefinition(const std::string &name, const Detail::Ptr &call);
+
+    /**
+     * @brief 把表达式树里的用户定义调用就地替换成展开后的文本。
+     *
+     * 与 `resolveCommands` 同一思路：自底向上替换成文本，再由调用方重新解析，
+     * 从而让化简/求导/积分等流程完全不需要感知定义表。
+     * @return 是否有任意一层被替换。
+     */
+    bool foldDefinitions(const Detail::Ptr &node, std::string *out);
+
     bool m_unicodeOutput = false;
     std::string m_lastResult;
+    /** @brief 用户定义表（键为名字，按插入顺序输出）。 */
+    std::vector<Definition> m_definitions;
+    /** @brief 定义折叠的递归深度（防止自引用定义无限展开）。 */
+    int m_foldDepth = 0;
+
+    /** @brief 按当前定义表构造解析选项（让 `f(2)` 走函数调用而非乘法）。 */
+    Detail::ParseOptions parseOptions() const;
+    /** @brief 使用当前定义表解析表达式。 */
+    Detail::ParseResult parse(const std::string &text) const;
 };
 
 } // namespace Cas
