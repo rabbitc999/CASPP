@@ -720,8 +720,15 @@ private:
             "subs", "substitute", "replace", "eval",
             "define", "let", "undef", "undefine", "forget", "defs", "definitions",
             "latex", "diff", "differentiate", "derivative", "integrate", "int", "integral",
-            "limit", "lim", "taylor", "series", "solve", "groebner", "gb", "resultant", "res",
+            "limit", "lim", "taylor", "series", "solve", "solveSystem", "solvesystem", "system",
+            "groebner", "gb", "resultant", "res",
             "critical", "extremum", "criticalpoints",
+            // 由 Engine 直接提供的模块入口（不在内置名单里就会被当成隐式乘法）
+            "determinant", "inverse", "transpose", "trace", "matmul", "dot", "rank", "rref",
+            "charpoly", "eigenvalues", "identity", "simplifyTrig", "specialSimplify",
+            "summation", "converges", "bernoulli", "guess",
+            "odeClassify", "odeSolve", "parse", "evaluate", "help", "quit", "exit",
+            "setprecision", "setPrecision", "unicode", "settings",
             "list", "equal", "range",
             // 级数与特殊函数
             "sum", "summation", "converge", "converges", "bernoulli", "guess",

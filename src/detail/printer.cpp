@@ -280,7 +280,29 @@ std::string textOf(const NodePtr &node, const PrintOptions &options, Precedence 
     }
 
     case NodeKind::Function: {
-        std::string text = std::string(node->name()) + "(";
+        const std::string name = node->name() ? node->name() : std::string();
+
+        // `equal(l, r)` 是解析器为 `a = b` 生成的内部节点，打印时还原成等式，
+        // 不能把内部函数名泄露给用户。
+        if (name == "equal" && node->size() == 2) {
+            const std::string left = textOf(node->operand(0), options, Precedence::Add);
+            const std::string right = textOf(node->operand(1), options, Precedence::Add);
+            return left + " = " + right;
+        }
+
+        // `list(a, b)` 是方括号列表 `[a, b]` 的内部表示；原样还原成方括号。
+        // 内部各处判断列表用的是节点 kind 与函数名，而不是这段文本，
+        // 所以还原不会影响 solveSystem / groebner 的重新解析。
+        if (name == "list") {
+            std::string text = "[";
+            for (std::size_t i = 0; i < node->size(); ++i) {
+                if (i) text += ", ";
+                text += textOf(node->operand(i), options, Precedence::Add);
+            }
+            return text + "]";
+        }
+
+        std::string text = name + "(";
         for (std::size_t i = 0; i < node->size(); ++i) {
             if (i) text += ", ";
             text += textOf(node->operand(i), options, Precedence::Add);
@@ -442,7 +464,23 @@ std::string latexOf(const NodePtr &node, const PrintOptions &options, Precedence
     }
 
     case NodeKind::Function: {
-        const std::string name = node->name();
+        const std::string name = node->name() ? node->name() : std::string();
+
+        // 与 textOf 保持对称：`equal(l, r)` 与 `list(...)` 都是解析器的内部表示，
+        // 分别还原成等式与方括号列表。
+        if (name == "equal" && node->size() == 2) {
+            return latexOf(node->operand(0), options, Precedence::Add) + " = " +
+                   latexOf(node->operand(1), options, Precedence::Add);
+        }
+        if (name == "list") {
+            std::string brace = "\\left[";
+            for (std::size_t i = 0; i < node->size(); ++i) {
+                if (i) brace += ", ";
+                brace += latexOf(node->operand(i), options, Precedence::Add);
+            }
+            return brace + "\\right]";
+        }
+
         static const char *kKnown[] = {"sin", "cos", "tan", "cot", "sec", "csc", "arcsin", "arccos",
                                        "arctan", "sinh", "cosh", "tanh", "log", "ln", "exp", "abs"};
         bool known = false;

@@ -389,7 +389,8 @@ bool isReservedName(const std::string &name) {
         "simplify", "simp", "expand", "factor", "together", "trigsimp", "trigs",
         "subs", "substitute", "replace", "eval", "define", "undef", "defs",
         "latex", "diff", "differentiate", "derivative", "integrate", "int", "integral",
-        "limit", "lim", "taylor", "series", "solve", "groebner", "gb", "resultant", "res",
+        "limit", "lim", "taylor", "series", "solve", "solveSystem", "solvesystem", "system",
+        "groebner", "gb", "resultant", "res",
         "critical", "extremum", "criticalpoints", "list", "equal", "range",
         "sum", "summation", "converge", "converges", "bernoulli", "guess",
         "det", "determinant", "inv", "inverse", "invert", "transpose", "trans", "trace", "tr",
@@ -1672,6 +1673,13 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
             return solveSystem(equations, variables);
         }
         return solve(text(0), count > 1 ? variableName(argument(1)) : "x");
+    }
+    if (name == "solveSystem" || name == "solvesystem" || name == "system") {
+        if (count < 2) return makeError("solveSystem 需要方程列表与变量列表，如 solveSystem([x+y=3, x-y=1], [x, y])");
+        std::vector<std::string> equations, variables;
+        for (NodePtr element : argument(0)->operands()) equations.push_back(toText(element));
+        for (NodePtr element : argument(1)->operands()) variables.push_back(toText(element));
+        return solveSystem(equations, variables);
     }
     if (name == "groebner" || name == "gb") {
         if (count < 2) return makeError("groebner 需要多项式列表与变量列表");

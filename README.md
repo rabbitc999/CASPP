@@ -65,7 +65,7 @@ build/caspp                               # 进入 REPL
 | Taylor 展开 | `taylor(f, 0, n)` | `taylor(cos(x), 0, 6)` |
 | 驻点与极值 | `critical(f [, x])` | `critical(x^3-3x)` → `x = -1（极大值，f = 2）; x = 1（极小值，f = -2）` |
 | 解方程 | `solve(eq, x)` | `solve(x^2-5x+6=0, x)` → `x = 2, x = 3` |
-| 解方程组 | `solve([eq1, eq2], [x, y])` | 高斯-约当消元 |
+| 解方程组 | `solve([eq1, eq2], [x, y])` / `solveSystem([eq1, eq2], [x, y])` | 高斯-约当消元 |
 | 不等式 | 直接输入 `>` `<` | `2x+1<3` → `x < 1` |
 | 多项式 GCD | `gcd(p, q)` | |
 | 结式 | `resultant(p, q, x)` | |
@@ -357,6 +357,25 @@ factor(x^4+y^4)                                → x^4 + y^4          （有理�
 - `taylor` 支持 Laurent 展开：奇点处先在 `(x−a)^k` 上展开，再逐项除以 `(x−a)^k`，因此 `taylor(exp(x)/x, 0, 3)` 会得到 `1/x + 1 + x/2 + x^2/6`
 - `critical` 解 `f'(x) = 0` 得驻点，用 `f''` 符号区分极小（`>0`）、极大（`<0`）；`f''= 0` 时如实标注「无法判定」
 
+### 内部节点的输出还原
+
+`equal(l, r)` 与 `list(a, b)` 是解析器内部造出来的节点名，不是用户能写的东西。
+打印器（文本与 LaTeX 两条路径）对它们做特判，还原成用户输入时的样子：
+
+```
+y=x                    → y = x                    （不是 equal(y, x)）
+[1,2,3]                → [1, 2, 3]                （不是 list(1, 2, 3)）
+[x+y=3, x-y=1]         → [x + y = 3, x - y = 1]
+latex([1,2,3])         → \left[1, 2, 3\right]
+```
+
+内部各处判断列表用的是节点 `kind` 与函数名，而不是这段文本，所以还原不影响
+`solveSystem` / `groebner` 把元素重新当表达式解析。
+
+与此相关，`kNames[]`（决定 `name(...)` 是调用还是隐式乘法）必须收录**所有**由
+`Engine` 直接提供的入口名，否则像 `solveSystem([...], [x, y])` 这种写法会被
+「未知函数」诊断挡下来。
+
 ## 架构
 
 ```
@@ -405,7 +424,7 @@ include/cas/
 
 ## 测试
 
-八套回归测试，`make test` 全绿：
+九套回归测试，`make test` 全绿：
 
 | 测试 | 内容 |
 | --- | --- |
@@ -414,6 +433,7 @@ include/cas/
 | `expressionTest` | 表达式树、化简、打印 |
 | `polynomialTest` | 展开、带余除法、GCD、Resultant、因式分解（含 16 项高次与多元用例）、通分 |
 | `definitionTest` | 变量替换（单/多变量、表达式代入、错误路径）、函数定义（单/多参、嵌套、与 diff/integrate/limit 组合）、常量定义、`defs`/`undef`、定义错误与隐式乘法语义不变 |
+| `printerTest` | 内部节点不外泄（`equal`→`y = x`、`list`→`[1, 2, 3]`，文本与 LaTeX 双路）、`solveSystem` 等模块入口不被「未知函数」诊断误伤、未知函数诊断本身仍生效 |
 | `calculusTest` | 141 项：解析、化简、展开、分解、求导、积分（含三角有理式/根式/部分分式）、极限（含幂指型）、Taylor/Laurent、驻点极值、求解、不等式、三角、Groebner、LaTeX、内存 |
 | `matrixTest` | 62 项：行列式、逆、转置、迹、乘法、秩、行最简形、特征多项式、特征值、单位阵、嵌套调用、代数恒等式、LaTeX、非法输入 |
 | `specialTest` | 111 项：Γ（整数/半整数/极点）、阶乘与双阶乘、Beta、组合数、谐波数、erf、Bessel、伯努利数、`specialsimplify`、幂和、p 级数、几何与算术-几何、裂项、敛散性、`guess`、跨模块组合 |
