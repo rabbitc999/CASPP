@@ -456,7 +456,7 @@ Result Engine::solve(const std::string &equation, const std::string &variable) {
 }
 
 Result Engine::dsolve(const std::string &equation, const std::string &unknown,
-                      const std::string &variable) {
+                      const std::string &variable, const std::vector<std::string> &conditions) {
     Result result;
     Timer timer(&result.elapsedMs);
 
@@ -474,24 +474,31 @@ Result Engine::dsolve(const std::string &equation, const std::string &unknown,
     const std::uint32_t unknownId = symbolOf(unknown);
     const std::uint32_t variableId = symbolOf(variable);
 
+    // 初值条件也要单独解析
+    Memory::Vector<Ptr> parsedConditions;
+    for (const std::string &condition : conditions) {
+        const ParseResult conditionParsed = parseInitialConditionText(condition);
+        if (!conditionParsed.ok) return makeError("初值条件解析失败：" + conditionParsed.message,
+                                                  conditionParsed.position);
+        parsedConditions.push_back(conditionParsed.expression);
+    }
+
     std::string method;
     std::string message;
-    Ptr solution = Detail::solveOde(residual, unknownId, variableId, &method, &message);
+    Ptr solution = Detail::solveOdeWithInitialValues(residual, unknownId, variableId, parsedConditions,
+                                                     &method, &message);
     if (!solution) return makeError(message.empty() ? "无法求解该微分方程" : message);
 
     const char *unknownName = symbolName(unknownId);
     const std::string name = unknownName ? unknownName : unknown;
 
     result.ok = true;
-    // 显式解（线性/二阶常系数）返回的形态是 `solution - y`，把它还原成 `y = solution`
+    // 显式解（线性/二阶常系数）返回的是 `y = …` 的右端
     if (method.find("线性") != std::string::npos || method.find("二阶") != std::string::npos) {
-        Ptr explicitForm = Detail::simplify(makeAdd(solution, Ptr(Node::makeSymbolById(unknownId))));
-        if (explicitForm) {
-            result.text = name + " = " + toText(explicitForm.get());
-            result.latex = name + " = " + toLatex(explicitForm.get());
-            m_lastResult = toText(explicitForm.get());
-            return result;
-        }
+        result.text = name + " = " + toText(solution.get());
+        result.latex = name + " = " + toLatex(solution.get());
+        m_lastResult = toText(solution.get());
+        return result;
     }
 
     // 其余方法给出隐式解：写成 `… = 0`，其中已包含积分常数 C1
@@ -943,6 +950,7 @@ std::string Engine::helpText() {
         "  dsolve(eq)                  求解 ODE，eq 形如 y' = y、y'' + y = 0\n"
         "  dsolve(eq, y)               指定未知函数\n"
         "  dsolve(eq, y, t)            指定自变量\n"
+        "  dsolve(eq, y(0)=1)          带初值条件，定出积分常数\n"
         "  一阶：可分离变量、一阶线性、齐次型（u = y/x）、伯努利方程\n"
         "  二阶：常系数线性（齐次三情形 + 待定系数法非齐次，含共振时乘 x）\n"
         "\n"
@@ -1204,9 +1212,38 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
     }
     if (name == "dsolve" || name == "ode") {
         if (count == 0) return makeError("dsolve 需要一个微分方程，如 dsolve(y' = x*y)");
-        const std::string unknownName = count > 1 ? variableName(argument(1)) : "y";
-        const std::string variableArg = count > 2 ? variableName(argument(2)) : "x";
-        return dsolve(text(0), unknownName, variableArg);
+
+        // 参数划分：第 1 个是方程；之后的参数依次是「未知函数」「自变量」和若干初值条件。
+        // 初值条件形如 `y(0) = 1`（解析后是 Function("y", 0) 与右端的等式），
+        // 未知函数/自变量则是裸符号，靠 elementKind 区分。
+        std::string unknownName = "y";
+        std::string variableArg = "x";
+        std::vector<std::string> conditions;
+        bool unknownTaken = false;
+        bool variableTaken = false;
+        for (std::size_t index = 1; index < count; ++index) {
+            const Ptr child = argument(index);
+            const std::string rendered = text(index);
+            if (rendered.find('=') != std::string::npos) {
+                conditions.push_back(rendered);
+                continue;
+            }
+            // 裸符号：先当未知函数，再当自变量
+            if (child && child->kind() == NodeKind::Symbol) {
+                if (!unknownTaken) {
+                    unknownName = variableName(child);
+                    unknownTaken = true;
+                    continue;
+                }
+                if (!variableTaken) {
+                    variableArg = variableName(child);
+                    variableTaken = true;
+                    continue;
+                }
+            }
+            conditions.push_back(rendered);
+        }
+        return dsolve(text(0), unknownName, variableArg, conditions);
     }
     if (name == "odeclassify") {
         if (count == 0) return makeError("odeclassify 需要一个微分方程");

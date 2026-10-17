@@ -194,6 +194,31 @@ void testSecondOrderResonance(Cas::Engine &engine) {
     expect(engine, "dsolve(y'' - 3*y' + 2*y = e^x)", "y = -x*e^x + C1*e^(2*x) + C2*e^x");
 }
 
+/* ------------------------------------------------- 初值问题 */
+
+void testInitialValues(Cas::Engine &engine) {
+    std::printf("\n== 初值问题（定积分常数）==\n");
+
+    // 一阶线性 + 一个条件
+    expect(engine, "dsolve(y' = y, y(0) = 1)", "y = e^x");
+    expect(engine, "dsolve(y' + y = x, y(0) = 1)", "y = e^(-x)*(x*e^x - e^x + 2)");
+    // 可分离变量：y' = x·y，y(0) = 2 ⇒ y = 2·e^(x²/2)
+    expect(engine, "dsolve(y' = x*y, y(0) = 2)", "y = 2*e^(1/2*x^2)");
+
+    // 二阶 + 两个条件（函数值与一阶导数）
+    expect(engine, "dsolve(y'' + y = 0, y(0) = 0, y'(0) = 1)", "y = sin(x)");
+    expect(engine, "dsolve(y'' + y = 0, y(0) = 1, y'(0) = 0)", "y = cos(x)");
+    expect(engine, "dsolve(y'' - 3*y' + 2*y = 0, y(0) = 1, y'(0) = 2)", "y = e^(2*x)");
+    // 非齐次方程的初值问题
+    expect(engine, "dsolve(y'' + y = 1, y(0) = 0, y'(0) = 0)", "y = -cos(x) + 1");
+
+    // 条件数不足：二阶方程只给一个条件，解里应保留一个自由常数
+    expectContains(engine, "dsolve(y'' + y = 0, y(0) = 0)", "C");
+
+    // 条件数超过方程阶数：无法确定常数，应当报错
+    expectError(engine, "dsolve(y'' + y = 0, y(0) = 0, y'(0) = 1, y''(0) = 2)");
+}
+
 /* --------------------------------------------------------- 边界 */
 
 void testBoundary(Cas::Engine &engine) {
@@ -208,6 +233,11 @@ void testBoundary(Cas::Engine &engine) {
 
     // 隐式解要带积分常数，否则答案不完整
     expectContains(engine, "dsolve(y' = y^2)", "C1");
+
+    // Riccati 型（y' = x² + y²）不属于伯努利，必须如实报错而不是给错解
+    expectError(engine, "dsolve(y' = x^2 + y^2)");
+    // 变系数伯努利仍应识别：y' = y/x + x·y²
+    expectContains(engine, "dsolve(y' = y/x + x*y^2)", "伯努利");
 }
 
 } // namespace
@@ -222,6 +252,7 @@ int main() {
     testSecondOrderHomogeneous(engine);
     testSecondOrderParticular(engine);
     testSecondOrderResonance(engine);
+    testInitialValues(engine);
     testBoundary(engine);
 
     std::printf("\n------------------------------------\n");

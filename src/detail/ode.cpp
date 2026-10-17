@@ -552,7 +552,9 @@ Ptr tryBernoulli(const Ptr &incomingRhs, std::uint32_t unknown, std::uint32_t va
         Ptr rest;
         if (!splitLinear(term, symbolNode(unknown), &linear, &rest)) return Ptr();
         if (mentions(linear, unknown) || mentions(rest, unknown)) return Ptr();
-        if (rest->isNumber() && !rest->numerator().isZero()) return Ptr();
+        // 完全不含 y 的独立项（例如 `y' = x² + y²` 里的 `x²`）说明右端不是
+        // `P·y + Q·yⁿ` 的形状，直接拒绝，不能当成「P = 0」混过去。
+        if (!(rest->isNumber() && rest->numerator().isZero())) return Ptr();
         if (haveP) return Ptr();
         p = linear;
         haveP = true;
@@ -1088,16 +1090,185 @@ Ptr solveOde(const Ptr &equation, std::uint32_t unknown, std::uint32_t variable,
     return Ptr();
 }
 
+/* ---------------------------------------------------------- 初值问题 */
+
+/**
+ * @brief 解析一条初值条件，取出导数阶数、取值点与右端值。
+ *
+ * 接受 `y(c) = v` 与 `y'(c) = v`（解析器把 `y(0)` 建成函数节点、`y'(0)` 建成
+ * 对 `Derivative` 的调用，这里两种形状都认）。
+ *
+ * @return 解析成功返回 true。
+ */
+bool parseInitialCondition(const Ptr &condition, std::uint32_t unknown, std::uint32_t *order,
+                           Ptr *point, Ptr *value) {
+    if (!condition || !order || !point || !value) return false;
+
+    // 条件总是 `lhs = rhs` 的形状
+    Ptr left;
+    Ptr right;
+    if (condition->kind() == NodeKind::Function && condition->name() &&
+        std::string(condition->name()) == "equal") {
+        if (condition->size() != 2) return false;
+        left = Ptr::borrow(condition->operand(0));
+        right = Ptr::borrow(condition->operand(1));
+    } else {
+        return false;
+    }
+    if (!left || !right) return false;
+
+    const char *unknownName = symbolName(unknown);
+    if (!unknownName) return false;
+
+    // 形如 `y(0)`：函数名就是未知函数
+    if (left->kind() == NodeKind::Function && left->name() && left->size() == 1 &&
+        std::string(left->name()) == std::string(unknownName)) {
+        *order = 0;
+        *point = Ptr::borrow(left->operand(0));
+        *value = right;
+        return static_cast<bool>(*point);
+    }
+
+    // 形如 `Derivative(y(0), x, n)`：解析器对 `y'(0)` 的产物
+    if (left->kind() == NodeKind::Function && left->name() && left->size() == 3 &&
+        std::string(left->name()) == "Derivative") {
+        Ptr inner = Ptr::borrow(left->operand(0));
+        Ptr orderNode = Ptr::borrow(left->operand(2));
+        long long parsedOrder = 0;
+        if (!orderNode || !orderNode->isSmallInteger(&parsedOrder) || parsedOrder < 0) return false;
+        if (inner->kind() == NodeKind::Function && inner->name() && inner->size() == 1 &&
+            std::string(inner->name()) == std::string(unknownName)) {
+            *order = static_cast<std::uint32_t>(parsedOrder);
+            *point = Ptr::borrow(inner->operand(0));
+            *value = right;
+            return static_cast<bool>(*point);
+        }
+        return false;
+    }
+    return false;
+}
+
 Ptr solveOdeWithInitialValues(const Ptr &equation, std::uint32_t unknown, std::uint32_t variable,
                               const Memory::Vector<Ptr> &conditions, std::string *description,
                               std::string *message) {
-    (void)conditions;
-    (void)equation;
-    (void)unknown;
-    (void)variable;
-    (void)description;
-    if (message) *message = "初值问题尚未接入";
-    return Ptr();
+    if (!equation) {
+        if (message) *message = "方程为空的";
+        return Ptr();
+    }
+
+    const int order = derivativeOrder(equation, unknown);
+    if (order <= 0) {
+        if (message) *message = "方程里没有出现 y 或其导数";
+        return Ptr();
+    }
+    if (order > 2) {
+        if (message) *message = "只支持一阶与二阶常微分方程";
+        return Ptr();
+    }
+
+    // 无初值时直接给通解，但要统一成「y = …」的右端：显式解补上 `+y`，
+    // 隐式解原样返回（调用方会按 `= 0` 打印）。
+    if (conditions.empty()) {
+        std::string generalMethod;
+        Ptr general = solveOde(equation, unknown, variable, &generalMethod, message);
+        if (!general) return Ptr();
+        if (description) *description = generalMethod;
+        const bool asExplicit = generalMethod.find("线性") != std::string::npos ||
+                                generalMethod.find("二阶") != std::string::npos;
+        if (!asExplicit) return general;
+        return simplify(makeAdd(general, symbolNode(unknown)));
+    }
+
+    std::string method;
+    Ptr general = solveOde(equation, unknown, variable, &method, message);
+    if (!general) return Ptr();
+
+    // 通解有两种形态：
+    // - 显式（线性 / 二阶常系数）：返回的是 `… - y`，补回 y 才是 `y = …`
+    // - 隐式（可分离 / 齐次型 / 伯努利）：本身就是 `F(x, y) = 0`
+    const bool explicitForm = method.find("线性") != std::string::npos || method.find("二阶") != std::string::npos;
+    if (!explicitForm) {
+        if (message) *message = "隐式解（" + method + "）里 y 与 x 缠在一起，无法直接套用初值条件";
+        return Ptr();
+    }
+
+    Ptr unknownSymbol = symbolNode(unknown);
+    // solveOde 的显式解形态是 `… - y`，因此这里加回 `+y` 得到 `y = …`
+    Ptr rightHandSide = simplify(makeAdd(general, unknownSymbol));
+    if (!rightHandSide) return Ptr();
+
+    // 显式解的右端不应再含未知函数；若含，说明求解器内部把某个条件和方程混在一起了
+    if (containsUnknown(rightHandSide, unknown)) {
+        if (message) *message = "求得的显式解仍含 y，无法代入初值条件";
+        return Ptr();
+    }
+
+    // 条件是逐条代入的，因此二阶方程要先给 `y(x0)`、再给 `y'(x0)`；
+    // 每条条件直接解出一个还没定的常数。
+    Memory::Vector<Ptr> constants;
+    constants.push_back(symbolNode(internSymbol("C1")));
+    if (order >= 2) constants.push_back(symbolNode(internSymbol("C2")));
+
+    std::size_t conditionCount = 0;
+    for (const Ptr &condition : conditions) {
+        std::uint32_t conditionOrder = 0;
+        Ptr point;
+        Ptr value;
+        if (!parseInitialCondition(condition, unknown, &conditionOrder, &point, &value)) {
+            if (message) *message = "无法识别初值条件：" + toText(condition.get());
+            return Ptr();
+        }
+        if (static_cast<int>(conditionOrder) > order) {
+            if (message) *message = "初值条件的阶数超过了方程的阶数";
+            return Ptr();
+        }
+
+        // 取 y 的 conditionOrder 阶导数，再在取值点求值
+        Ptr target = rightHandSide;
+        for (std::uint32_t k = 0; k < conditionOrder; ++k) {
+            target = differentiate(target, variable);
+            if (!target) return Ptr();
+        }
+        Ptr substituted = substitute(target, variable, point);
+        if (!substituted) return Ptr();
+        Ptr residual = simplify(makeAdd(substituted, makeNegate(value)));
+        if (!residual) return Ptr();
+
+        // residual 是各常数的线性式：取第一个还没确定的常数的系数与其余部分
+        bool solvedOne = false;
+        for (const Ptr &constant : constants) {
+            if (!mentions(rightHandSide, constant->symbolId())) continue;  // 已解出
+            Ptr linear;
+            Ptr rest;
+            if (!splitLinear(residual, constant, &linear, &rest)) continue;
+            if (linear->isNumber() && linear->numerator().isZero()) continue;
+
+            // 其余项（把该常数置 0 后的残差）作为方程右端
+            Ptr constantPart = substitute(residual, constant->symbolId(), integer(0));
+            if (!constantPart) return Ptr();
+            constantPart = simplify(constantPart);
+            if (!constantPart) return Ptr();
+
+            Ptr solvedValue = simplify(makeDivide(makeNegate(constantPart), linear));
+            if (!solvedValue || mentions(solvedValue, variable)) return Ptr();
+
+            rightHandSide = simplify(substitute(rightHandSide, constant->symbolId(), solvedValue));
+            if (!rightHandSide) return Ptr();
+            solvedOne = true;
+            break;
+        }
+        if (!solvedOne) {
+            if (message) *message = "初值条件无法确定积分常数（条件可能与方程不相容）";
+            return Ptr();
+        }
+        ++conditionCount;
+    }
+
+    if (description) *description = method + "（已代入初值）";
+    (void)conditionCount;
+    return rightHandSide;
 }
+
+
 
 } // namespace Cas::Detail

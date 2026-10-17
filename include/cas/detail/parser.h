@@ -43,6 +43,14 @@ struct ParseResult {
 /** @brief 解析单个表达式。 */
 ParseResult parseExpression(const std::string &text);
 
+/**
+ * @brief 解析一条初值条件，如 `y(0) = 1`、`y'(0) = 0`。
+ *
+ * 与 `parseExpression` 的区别只在于：裸符号后跟括号按**函数调用**处理，
+ * 这样 `y(0)` 才不会被读成 `y` 乘 `0`。
+ */
+ParseResult parseInitialConditionText(const std::string &text);
+
 /** @brief 把常数的名字登记到符号表（`pi`、`e`、`infinity` 等按常数处理，其余为符号）。 */
 bool isReservedConstantName(const std::string &name);
 

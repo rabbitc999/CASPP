@@ -87,12 +87,16 @@ public:
     /**
      * @brief 解常微分方程。
      *
-     * @param equation 方程，如 `y' = x*y`、`y'' + y = 0`（`=` 可省略，缺省视为 = 0）。
-     * @param unknown  未知函数名，缺省 `y`。
-     * @param variable 自变量名，缺省 `x`。
+     * @param equation   方程，如 `y' = x*y`、`y'' + y = 0`（`=` 可省略，缺省视为 = 0）。
+     * @param unknown    未知函数名，缺省 `y`。
+     * @param variable   自变量名，缺省 `x`。
+     * @param conditions 初值条件，如 `y(0) = 1`、`y'(0) = 0`；为空时给通解。
+     *
+     * 初值条件只对能给出显式解的类型（一阶线性、二阶常系数）生效；隐式解会明确提示。
      */
     Result dsolve(const std::string &equation, const std::string &unknown = "y",
-                  const std::string &variable = "x");
+                  const std::string &variable = "x",
+                  const std::vector<std::string> &conditions = std::vector<std::string>());
 
     /* ------------------------------------------------------ 工具 */
 

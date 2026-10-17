@@ -39,7 +39,10 @@ struct Token {
 /** @brief 递归下降解析器。 */
 class Parser {
 public:
-    Parser(const std::string &text) : m_text(text) { m_position = 0; }
+    Parser(const std::string &text, bool allowUnknownCalls = false)
+        : m_text(text), m_allowUnknownCalls(allowUnknownCalls) {
+        m_position = 0;
+    }
 
     /** @brief 解析整个表达式。 */
     ParseResult run() {
@@ -385,6 +388,36 @@ private:
         return base;
     }
 
+    /** @brief 把 `callee(...)` 的括号部分接到 callee 上，生成函数调用节点。 */
+    Ptr parseCallOn(const Ptr &callee) {
+        if (!callee || m_token.kind != TokenKind::LeftParen) return Ptr();
+        const char *name = callee->name();
+        if (callee->kind() != NodeKind::Symbol || !name) return Ptr();
+        advance();
+        Memory::Vector<Ptr> arguments;
+        if (m_token.kind != TokenKind::RightParen) {
+            for (;;) {
+                Ptr argument = parseAssignment();
+                if (!argument) return Ptr();
+                arguments.push_back(argument);
+                if (m_token.kind == TokenKind::Operator && m_token.text == ",") {
+                    advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        if (m_token.kind != TokenKind::RightParen) {
+            fail("函数调用缺少右括号");
+            return Ptr();
+        }
+        advance();
+        Memory::Vector<NodePtr> raw;
+        raw.reserve(arguments.size());
+        for (const Ptr &argument : arguments) raw.push_back(argument.get());
+        return Ptr(Node::makeFunction(name, raw));
+    }
+
     Ptr parsePostfix() {
         Ptr value = parseAtom();
         if (!value) return Ptr();
@@ -419,13 +452,23 @@ private:
                     ++order;
                 }
                 // 简单符号的撇号按 ODE 记法解释：y' ⇒ Derivative(y, x)
-                // 其它形态（如 (x^2+1)'）沿用 diff(expr) 的写法
+                // 其它形态（如 (x^2+1)'）沿用 diff(expr) 的写法。
+                //
+                // `y'(0)` 这种"导数在某点取值"：撇号后面紧跟括号时，括号归属于
+                // 被求导的函数本身，于是生成 Derivative(y(0), x, n)——初值条件
+                // 的解析就靠这个形状识别。
                 if (value->kind() == NodeKind::Symbol && order <= 3) {
+                    Ptr target = value;
+                    if (m_allowUnknownCalls && m_token.kind == TokenKind::LeftParen) {
+                        Ptr call = parseCallOn(value);
+                        if (!call) return Ptr();
+                        target = call;
+                    }
                     const std::string name = value->name() ? value->name() : std::string();
                     const std::uint32_t variableId = internSymbol("x");
                     Ptr variablePtr = Ptr(Node::makeSymbolById(variableId));
                     Ptr orderPtr = integer(order);
-                    Memory::Vector<NodePtr> arguments{value.get(), variablePtr.get(), orderPtr.get()};
+                    Memory::Vector<NodePtr> arguments{target.get(), variablePtr.get(), orderPtr.get()};
                     value = Ptr(Node::makeFunction("Derivative", arguments));
                     continue;
                 }
@@ -558,6 +601,34 @@ private:
             return Ptr(Node::makeFunction(canonical, raw));
         }
 
+        // 未知函数调用：仅初值条件这类场景需要（`y(0)` 是"函数在 0 点取值"，
+        // 而不是 y 乘 0）。默认关闭，避免 `x(1)` 这类写法被误读成函数。
+        if (m_allowUnknownCalls && m_token.kind == TokenKind::LeftParen) {
+            advance();
+            Memory::Vector<Ptr> arguments;
+            if (m_token.kind != TokenKind::RightParen) {
+                for (;;) {
+                    Ptr argument = parseAssignment();
+                    if (!argument) return Ptr();
+                    arguments.push_back(argument);
+                    if (m_token.kind == TokenKind::Operator && m_token.text == ",") {
+                        advance();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            if (m_token.kind != TokenKind::RightParen) {
+                fail("函数调用缺少右括号");
+                return Ptr();
+            }
+            advance();
+            Memory::Vector<NodePtr> raw;
+            raw.reserve(arguments.size());
+            for (const Ptr &argument : arguments) raw.push_back(argument.get());
+            return Ptr(Node::makeFunction(name.c_str(), raw));
+        }
+
         // 未声明的名字按符号处理（`sqrt` 单独出现时也是符号）
         return Ptr(Node::makeSymbol(name));
     }
@@ -594,6 +665,7 @@ private:
     }
 
     const std::string &m_text;
+    bool m_allowUnknownCalls = false;
     std::size_t m_position = 0;
     Token m_token;
     std::string m_error;
@@ -607,8 +679,36 @@ bool isReservedConstantName(const std::string &name) {
            name == "inf" || name == "infinity" || name == "EulerGamma" || name == "eulergamma";
 }
 
+namespace {
+
+/**
+ * @brief 判断输入是否以 `dsolve(` / `ode(` 开头。
+ *
+ * 这两个命令的参数里可能带初值条件 `y(0) = 1`，需要把裸符号后跟括号读成函数调用；
+ * 其它场景保持"隐式乘法"的直觉读法。
+ */
+bool startsWithOdeCommand(const std::string &text) {
+    std::size_t index = 0;
+    while (index < text.size() && std::isspace(static_cast<unsigned char>(text[index]))) ++index;
+    for (const char *name : {"dsolve", "ode"}) {
+        const std::size_t length = std::strlen(name);
+        if (text.compare(index, length, name) != 0) continue;
+        std::size_t after = index + length;
+        while (after < text.size() && std::isspace(static_cast<unsigned char>(text[after]))) ++after;
+        if (after < text.size() && text[after] == '(') return true;
+    }
+    return false;
+}
+
+} // namespace
+
 ParseResult parseExpression(const std::string &text) {
-    Parser parser(text);
+    Parser parser(text, startsWithOdeCommand(text));
+    return parser.run();
+}
+
+ParseResult parseInitialConditionText(const std::string &text) {
+    Parser parser(text, /*allowUnknownCalls=*/true);
     return parser.run();
 }
 
