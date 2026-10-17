@@ -150,6 +150,33 @@ void testDefineErrors() {
     expectText(&engine, "define(g(x, y), x+y)", "已定义 g(x, y) = x + y");
     expectError(&engine, "g(1)");
     expectError(&engine, "g(1, 2, 3)");
+
+    // 未定义的名字 + 含逗号的括号：给出「未定义」而不是含糊的「缺少右括号」
+    expectError(&engine, "h(x, t)");
+    expectError(&engine, "h(a, b, c)");
+}
+
+/* ------------------------------------- 函数调用 vs 隐式乘法的分界 */
+
+void testCallVersusMultiply() {
+    Cas::Engine engine;
+
+    // 未定义：单参数括号仍是隐式乘法，既有语义不变
+    expectText(&engine, "f(x)", "f*x");
+    expectText(&engine, "f(-1)", "-f");
+    expectText(&engine, "f(g(x))", "f*g*x");
+
+    // 定义之后就按调用解析，参数个数不匹配要报错
+    expectText(&engine, "define(f(x), x^2+1)", "已定义 f(x) = x^2 + 1");
+    expectText(&engine, "f(x)", "x^2 + 1");
+    expectError(&engine, "f(x, t)");          // 多给一个参数
+    expectError(&engine, "f(x, t, u)");       // 多给两个
+
+    // 两参函数少给/多给都要报错
+    expectText(&engine, "define(g(x, y), x+y)", "已定义 g(x, y) = x + y");
+    expectText(&engine, "g(1, 2)", "3");
+    expectError(&engine, "g(1)");
+    expectError(&engine, "g(1, 2, 3)");
 }
 
 /* ---------------------------------------------- 既有隐式乘法语义不受影响 */
@@ -180,6 +207,7 @@ int main() {
     testDefineConstant(); std::printf("define constant ok\n");
     testDefinitions();   std::printf("definitions ok\n");
     testDefineErrors();  std::printf("define errors ok\n");
+    testCallVersusMultiply(); std::printf("call vs multiply ok\n");
     testNoRegression();  std::printf("no regression ok\n");
 
     if (failures == 0) {

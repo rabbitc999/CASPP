@@ -563,8 +563,14 @@ Result Engine::expandDefinition(const std::string &name, const Detail::Ptr &call
 
     const std::size_t given = call->size();
     if (given != found->parameters.size()) {
+        std::string signature = name + "(";
+        for (std::size_t index = 0; index < found->parameters.size(); ++index) {
+            if (index) signature += ", ";
+            signature += found->parameters[index];
+        }
+        signature += ")";
         return makeError("`" + name + "` 需要 " + std::to_string(found->parameters.size()) + " 个参数，实际给了 " +
-                         std::to_string(given) + " 个");
+                         std::to_string(given) + " 个；定义是 " + signature);
     }
 
     const ParseResult parsedBody = parse(found->body);

@@ -668,8 +668,44 @@ private:
             return Ptr(Node::makeFunction(name.c_str(), raw));
         }
 
+        // 名字后面跟着 `(a, b)` 这种含逗号的括号：用户显然想写函数调用，
+        // 但这个名字不在内置表里、也不是已登记的定义（否则上面就处理了）。
+        // 这时按乘法解释只会得到"缺少右括号"这类误导性诊断，直接点明原因。
+        // 只针对含逗号的形式：`f(x)` 仍保留隐式乘法（`f*x`）的既有语义。
+        if (m_token.kind == TokenKind::LeftParen && !isFunctionName(name) && !isUserFunction(name) &&
+            parenthesizedHasComma()) {
+            fail("`" + name + "` 不是已知函数：若要用 " + name +
+                 "(a, b) 这种写法，请先 define(" + name + "(x, y), ...) 声明它的参数");
+            return Ptr();
+        }
+
         // 未声明的名字按符号处理（`sqrt` 单独出现时也是符号）
         return Ptr(Node::makeSymbol(name));
+    }
+
+    /**
+     * @brief 当前位置若是 `(`，判断到配对右括号之间是否出现顶层逗号。
+     *
+     * 只看括号深度为 1 处的逗号，`((a), (b))` 这类嵌套不影响外层判断。
+     * 不消耗 token。
+     */
+    bool parenthesizedHasComma() const {
+        if (m_token.kind != TokenKind::LeftParen) return false;
+        int depth = 0;
+        // 从左括号自身开始扫（m_token.start 指向当前 token 起点）
+        std::size_t index = m_token.start;
+        for (; index < m_text.size(); ++index) {
+            const char character = m_text[index];
+            if (character == '(') {
+                ++depth;
+            } else if (character == ')') {
+                --depth;
+                if (depth == 0) return false; // 找到配对右括号，期间没有逗号
+            } else if (character == ',' && depth == 1) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** @brief 已知函数名表：决定 `name(...)` 是调用还是乘法。 */
