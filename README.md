@@ -6,6 +6,8 @@
 参考了 `gitee.com/rabbitc999/cas` 的内存分配器设计与 sympy 的算法组织方式，
 命名风格沿用 Qt 式驼峰（`Cas::Engine`、`calculate()`、`memoryStats()`）。
 
+以 [MIT 协议](LICENSE) 发布，可自由使用、修改、分发，保留版权声明即可。
+
 ## 构建与运行
 
 ```bash
@@ -393,3 +395,18 @@ include/cas/
   隐式解不做常数代入；非齐次特解的试探式只覆盖
   多项式、`e^{kx}`、`cos/sin(kx)`，右端为这些的乘积或和时提示「超出待定系数法范围」
   并退化为只给齐次解
+
+## 协议
+
+本项目以 **MIT License** 发布，全文见 [`LICENSE`](LICENSE)。
+
+```
+Copyright (c) 2026 小兔糖糖OvO
+```
+
+简单说：可以商用、可以改、可以闭源分发，只要在副本或实质部分里保留上面的版权声明
+与许可声明即可。软件按「现状」提供，不附任何担保。
+
+第三方参考说明：算法组织方式参考了 [sympy](https://github.com/sympy/sympy)（BSD-3-Clause）
+的公开文档与源码思路，内存分配器设计参考了 `gitee.com/rabbitc999/cas`；本仓库的代码为
+独立实现，未直接复制上述项目的源代码文件。

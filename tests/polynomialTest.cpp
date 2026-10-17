@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 // 多项式代数自检：展开、带余除法、GCD、Resultant、因式分解、通分。
 #include "cas/allocator.h"
 #include "cas/engine.h"

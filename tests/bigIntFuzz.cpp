@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 // 大数随机对拍：cstdlib 只做本地一致性校验（q*b+r == a、r < |b|），再覆盖 NTT 乘法路径。
 #include "cas/detail/bigInt.h"
 

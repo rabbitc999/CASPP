@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 #ifndef CAS_MEMORY_H
 #define CAS_MEMORY_H
 

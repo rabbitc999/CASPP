@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 #include "cas/detail/multivariate.h"
 #include "cas/detail/polynomial.h"
 

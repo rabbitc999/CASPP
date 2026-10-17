@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 #ifndef CAS_DETAIL_CALCULUS_H
 #define CAS_DETAIL_CALCULUS_H
 

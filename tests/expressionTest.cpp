@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 // 表达式树与自动化简的自检：验证扁平化、同类项合并、数值折叠、恒等式消去。
 #include "cas/allocator.h"
 #include "cas/detail/node.h"

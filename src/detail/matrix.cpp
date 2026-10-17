@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 /**
  * @file matrix.cpp
  * @brief 符号矩阵实现。

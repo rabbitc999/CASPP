@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 小兔糖糖OvO
+
 // 数值层与分配器的独立自检：在接入表达式树之前先跑通这一层。
 #include "cas/allocator.h"
 #include "cas/detail/bigInt.h"
