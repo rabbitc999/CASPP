@@ -391,6 +391,51 @@ Result Engine::taylor(const std::string &expression, const std::string &point, i
     return result;
 }
 
+Result Engine::criticalPoints(const std::string &expression, const std::string &variable) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+    const ParseResult body = parseExpression(expression);
+    if (!body.ok) return makeError(body.message, body.position);
+
+    const std::uint32_t id = symbolOf(variable);
+    Ptr derivative = Detail::differentiate(body.expression, id);
+    if (!derivative || !Detail::simplify(derivative)) return makeError("无法求导，无法定位驻点");
+
+    Memory::Vector<Detail::CriticalPoint> points;
+    if (!Detail::criticalPoints(body.expression, id, &points)) {
+        return makeError("在 f'(x) = 0 上没有找到实驻点（或当前求解器无法解出）");
+    }
+
+    std::string text;
+    char buffer[512];
+    for (std::size_t index = 0; index < points.size(); ++index) {
+        const Detail::CriticalPoint &point = points[index];
+        if (!point.location) continue;
+        PrintOptions options;
+        options.useUnicode = m_unicodeOutput;
+        const std::string location = toText(point.location.get(), options);
+        if (point.kind == Detail::CriticalKind::Unknown) {
+            std::snprintf(buffer, sizeof(buffer), "%s = %s（%s）", variable.c_str(), location.c_str(),
+                          Detail::criticalKindName(point.kind));
+        } else {
+            const std::string value =
+                point.value ? toText(point.value.get(), options) : std::string("?");
+            std::snprintf(buffer, sizeof(buffer), "%s = %s（%s，f = %s）", variable.c_str(),
+                          location.c_str(), Detail::criticalKindName(point.kind), value.c_str());
+        }
+        if (!text.empty()) text += "; ";
+        text += buffer;
+    }
+    if (text.empty()) return makeError("未得到可用驻点");
+
+    result.ok = true;
+    result.text = text;
+    // 与收敛/分类等「文字型结果」一致：LaTeX 用 \text{...} 包住，避免空字符串。
+    result.latex = "\\text{" + text + "}";
+    m_lastResult = result.text;
+    return result;
+}
+
 /* -------------------------------------------------------------- 求解 */
 
 namespace {
@@ -910,6 +955,7 @@ std::string Engine::helpText() {
         "  integrate(expr, a, b [, var]) 定积分\n"
         "  limit(expr, point [, var])  极限（point 可为 oo）\n"
         "  taylor(expr, point, n)      Taylor 展开\n"
+        "  critical(expr [, var])      驻点与极值判定\n"
         "  solve(equation [, var])     解方程，equation 形如 x^2-1=0\n"
         "  solve([eq1, eq2], [x, y])   解线性方程组\n"
         "  groebner([p1, p2], [x, y])  Groebner 基\n"
@@ -1188,6 +1234,10 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
         long long order = 0;
         if (!argument(2)->isSmallInteger(&order)) return makeError("Taylor 展开阶数必须是整数");
         return taylor(text(0), text(1), static_cast<int>(order), count > 3 ? variableName(argument(3)) : "x");
+    }
+    if (name == "critical" || name == "extremum" || name == "criticalpoints") {
+        if (count == 0) return makeError("critical 需要表达式，如 critical(x^2-1)");
+        return criticalPoints(text(0), count > 1 ? variableName(argument(1)) : "x");
     }
     if (name == "solve") {
         if (count == 0) return makeError("solve 需要至少一个参数");

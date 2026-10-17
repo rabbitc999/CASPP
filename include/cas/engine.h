@@ -75,6 +75,13 @@ public:
     Result limit(const std::string &expression, const std::string &point, const std::string &variable = "x");
     Result taylor(const std::string &expression, const std::string &point, int order,
                   const std::string &variable = "x");
+    /**
+     * @brief 求驻点并判定极值。
+     *
+     * 解 `f'(x) = 0` 得驻点，再用 `f''` 的符号区分极小、极大与拐点。
+     * 输出形如 `x = 1（极小值，f = -1）; x = -1（极大值，f = 3）`。
+     */
+    Result criticalPoints(const std::string &expression, const std::string &variable = "x");
     /** @brief 解方程；`equation` 可写成 `x^2-1=0` 或 `x^2-1`。 */
     Result solve(const std::string &equation, const std::string &variable = "x");
     /** @brief 解方程组：`{"x+y=3", "x-y=1"}`。 */

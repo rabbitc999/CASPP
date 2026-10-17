@@ -644,6 +644,7 @@ private:
             "simplify", "simp", "expand", "factor", "together", "trigsimp", "trigs",
             "latex", "diff", "differentiate", "derivative", "integrate", "int", "integral",
             "limit", "lim", "taylor", "series", "solve", "groebner", "gb", "resultant", "res",
+            "critical", "extremum", "criticalpoints",
             "list", "equal", "range",
             // 级数与特殊函数
             "sum", "summation", "converge", "converges", "bernoulli", "guess",

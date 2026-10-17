@@ -73,6 +73,24 @@ Ptr factor(const Ptr &expression);
 /** @brief 通分合并各项，返回单一分式。 */
 Ptr together(const Ptr &expression);
 
+/**
+ * @brief 深度通分：能处理"分母里还套着分式"的嵌套形态。
+ *
+ * 万能代换 `t = tan(u/2)` 之后，被积函数常是
+ * `2/((t²+1)·((1−t²)/(t²+1)+1))` 这样的结构，普通 `together` 只在最外层合并，
+ * 拿不到真正的有理函数形态。这里反复把嵌套分式拆成"分子/分母"再合并，
+ * 直到分母里不含分式为止。
+ */
+Ptr togetherDeep(const Ptr &expression);
+
+/**
+ * @brief 把表达式化成 `P/Q` 的规范形式（P、Q 中都不再含分式）。
+ *
+ * `Mul` 逐因子拆分、`Add` 统一公分母、`Pow` 按整数指数分子分母互换。
+ * 遇到非整数指数且底数含分式时返回 false。
+ */
+bool toQuotient(const Ptr &expression, Ptr *numerator, Ptr *denominator);
+
 /** @brief 有理函数约分：分子分母取多项式 GCD 后相约。 */
 Ptr cancelCommon(const Ptr &numerator, const Ptr &denominator, std::uint32_t variable);
 

@@ -282,6 +282,51 @@ void testMemory(Cas::Engine &engine) {
     }
 }
 
+/**
+ * @brief 微积分加深：三角有理式、根式代换、部分分式、幂指极限、Laurent、驻点。
+ *
+ * 这一组覆盖的规则都是"旧版返回原式/报错"的场景，因此期望值都写死成闭式，
+ * 一旦某条规则退化就能直接看出来。
+ */
+void testCalculusExtensions(Cas::Engine &engine) {
+    // 三角有理式：万能代换 t = tan(u/2)
+    expect(engine, "integrate(1/sin(x), x)", "log(tan(1/2*x))");
+    expect(engine, "integrate(1/(1+cos(x)), x)", "tan(1/2*x)");
+
+    // 根式三角代换
+    expect(engine, "integrate(1/sqrt(1-x^2), x)", "asin(x)");
+    expect(engine, "integrate(x/sqrt(1-x^2), x)", "-sqrt((-x^2 + 1))");
+
+    // 部分分式分解（含重数与不可约二次因子）
+    expect(engine, "integrate(1/(t^3-1), t)",
+           "-1/2*atan((t + 1/2)/sqrt(3/4))*1/sqrt(3/4) - 1/6*log(t^2 + t + 1) + 1/3*log(t - 1)");
+
+    // sin/cos 幂与 log 幂
+    expect(engine, "integrate(sin(x)^2, x)", "-1/4*sin(2*x) + 1/2*x");
+    expect(engine, "integrate(cos(x)^3, x)", "-1/3*sin(x)^3 + sin(x)");
+    expect(engine, "integrate(log(x), x)", "x*log(x) - x");
+
+    // 幂指型未定式：F^G = e^(G·ln F)
+    expect(engine, "limit((1+x)^(1/x), x, 0)", "e");
+    expect(engine, "limit(x^x, x, 0)", "1");
+    // x→∞ 换元兜底：x = 1/t 转 t→0
+    expect(engine, "limit(x*log(1+1/x), x, oo)", "1");
+    expect(engine, "limit(x*sin(1/x), x, oo)", "1");
+
+    // Laurent 展开：奇点处出现负幂项
+    expect(engine, "taylor(exp(x)/x, 0, 3)", "1/6*x^2 + 1/x + 1/2*x + 1");
+    expect(engine, "taylor(cos(x)/x^2, 0, 3)", "1/x^2 - 1/2");
+
+    // 驻点与极值判定
+    expect(engine, "critical(x^2-2*x)", "x = 1（极小值，f = -1）");
+    expect(engine, "critical(x^3-3*x)", "x = -1（极大值，f = 2）; x = 1（极小值，f = -2）");
+    expect(engine, "critical(x^3)", "x = 0（无法判定）");
+    expect(engine, "critical(sin(x), x)", "x = 1/2*pi（极大值，f = 1）");
+    expect(engine, "critical(cos(x), x)", "x = 0（极大值，f = 1）");
+    // 严格单调：没有驻点，应明确报错而不是返回空串
+    expectError(engine, "critical(2*x+1)");
+}
+
 } // namespace
 
 int main() {
@@ -294,6 +339,7 @@ int main() {
     testDerivative(engine);
     testIntegration(engine);
     testRationalIntegration(engine);
+    testCalculusExtensions(engine);
     testLimit(engine);
     testTaylor(engine);
     testSolve(engine);

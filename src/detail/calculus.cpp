@@ -1,6 +1,8 @@
 #include "cas/detail/calculus.h"
 #include "cas/detail/polynomial.h"
 #include "cas/detail/printer.h"
+#include "cas/detail/solver.h"
+#include "cas/detail/trigonometry.h"
 
 #include <algorithm>
 #include <cmath>
@@ -482,6 +484,71 @@ Ptr integrateRecursive(const Ptr &expression, std::uint32_t variable, int depth)
             }
         }
 
+        // log(u)^n：递推 ∫ln^n u du = u·ln^n u − n·∫ln^(n-1) u du
+        if (base->kind() == NodeKind::Function && base->name() &&
+            std::strcmp(base->name(), "log") == 0 && !dependsOn(exponent.get(), variable)) {
+            long long power = 0;
+            if (exponent->isSmallInteger(&power) && power >= 1) {
+                Ptr innerArgument = Ptr::borrow(base->operand(0));
+                Ptr innerSlope, innerOffset;
+                if (linearForm(innerArgument, variable, &innerSlope, &innerOffset) && !innerSlope->isZero()) {
+                    if (power == 1) {
+                        // ∫ln(ax+b) dx = (ax+b)·ln(ax+b)/a − x
+                        Ptr product = makeDivide(makeMul(innerArgument, expression), innerSlope);
+                        return makeAdd(product, makeNegate(variableNode(variable)));
+                    }
+                    Ptr lowerPower = makePow(base, integer(power - 1));
+                    Ptr innerIntegral = integrateRecursive(lowerPower, variable, depth + 1);
+                    if (innerIntegral) {
+                        Ptr boundaryTerm = makeDivide(makeMul(innerArgument, expression), innerSlope);
+                        return makeAdd(boundaryTerm, makeMul(integer(-power), innerIntegral));
+                    }
+                }
+            }
+        }
+
+        // sin^n(u)、cos^n(u)：奇数 n 直接换元，偶数 n 反复降幂后递归
+        if (base->kind() == NodeKind::Function && !dependsOn(exponent.get(), variable)) {
+            const char *functionName = base->name();
+            long long power = 0;
+            bool integerPower = exponent->isSmallInteger(&power);
+            if (functionName && integerPower && power >= 2 &&
+                (std::strcmp(functionName, "sin") == 0 || std::strcmp(functionName, "cos") == 0)) {
+                Ptr innerArgument = Ptr::borrow(base->operand(0));
+                Ptr innerSlope, innerOffset;
+                if (linearForm(innerArgument, variable, &innerSlope, &innerOffset) && !innerSlope->isZero()) {
+                    const bool isSine = std::strcmp(functionName, "sin") == 0;
+                    if (power % 2 == 1) {
+                        // 奇次：拆出一个因子，剩余偶次用 1 - sin²（或 1 - cos²）换成 cos（或 sin）
+                        Ptr single = Ptr(Node::makeFunction(functionName, Memory::Vector<NodePtr>{innerArgument.get()}));
+                        Ptr remaining = makePow(base, integer(power - 1));
+                        // 幂次减一的偶次式转成另一函数的幂：cos²ᵏ = (1 - sin²)ᵏ
+                        const char *otherName = isSine ? "cos" : "sin";
+                        Ptr other = Ptr(Node::makeFunction(otherName, Memory::Vector<NodePtr>{innerArgument.get()}));
+                        Ptr complement = makeAdd(integer(1), makeNegate(makePow(other, integer(2))));
+                        Ptr rewritten = makePow(single, integer(1));
+                        for (long long i = 0; i < power - 1; i += 2) {
+                            rewritten = makeMul(rewritten, complement);
+                        }
+                        (void)remaining;
+                        Ptr innerIntegral = integrateRecursive(simplify(rewritten), variable, depth + 1);
+                        if (innerIntegral) return innerIntegral;
+                    } else {
+                        // 偶次：用降幂公式把 sin²(u) 换成 (1−cos 2u)/2，再递归
+                        Ptr squared = makePow(base, integer(2));
+                        Ptr reduced = squared ? reduceTrigPower(squared) : Ptr();
+                        if (reduced) {
+                            // 降幂只处理平方，剩下的偶次幂继续保留
+                            Ptr scaled = reduced;
+                            if (power > 2) scaled = makeMul(reduced, makePow(base, integer(power - 2)));
+                            Ptr innerIntegral = integrateRecursive(simplify(scaled), variable, depth + 1);
+                            if (innerIntegral) return innerIntegral;
+                        }
+                    }
+                }
+            }
+        }
+
         // √(a²-x²) 型与 1/√(a²-x²) 型：用反三角公式
         return Ptr();
     }
@@ -508,10 +575,15 @@ Ptr integrateRecursive(const Ptr &expression, std::uint32_t variable, int depth)
             return makeDivide(expression, slope);
         }
         if (std::strcmp(name, "log") == 0) {
-            // ∫ ln(x) dx = x·ln x - x
+            // ∫ ln(u) dx，u = a·x + b：换元后 ∫ln(u)du/a = (u·ln u − u)/a
             if (inner->kind() == NodeKind::Symbol && inner->symbolId() == variable) {
                 Ptr x = variableNode(variable);
                 return makeAdd(makeMul(x.share(), expression), makeNegate(x.share()));
+            }
+            if (linear) {
+                Ptr scaled = makeDivide(makeMul(inner, expression), slope);
+                Ptr correction = makeDivide(inner, slope);
+                return makeAdd(scaled, makeNegate(correction));
             }
             return Ptr();
         }
@@ -707,7 +779,564 @@ Ptr integrateQuadraticDenominator(const UnivariatePoly &numerator, const Univari
     return simplify(result);
 }
 
+/* ------------------------------------------------------ 部分分式分解 */
+
+/**
+ * @brief 真分式 `P/Q` 的部分分式分解积分。
+ *
+ * 先把分母因式分解成一次因子（可带重数），再设
+ * `P/Q = Σ Σ_{k=1..mᵢ} Aᵢₖ / fᵢ^k`，用待定系数法解出 `Aᵢₖ`：
+ * 把等式两边乘回 `Q` 展开，按 variable 的幂次逐项比较可得线性方程组。
+ * 逐项积分为 `A·ln|f|/a`（k=1）与 `A·f^(1-k)/(a(1-k))`（k>1）。
+ *
+ * 只处理分母能完全分解成一次因式的情形；含不可约二次因子时退回
+ * `integrateQuadraticDenominator`（单个二次因子）或报错。
+ */
+/** @brief 分母分解出的一个因式及其重数。 */
+struct FractionFactor {
+    Ptr base;                    ///< 首一化后的因式
+    int multiplicity = 1;        ///< 重数
+    std::size_t degree = 1;      ///< 因式次数
+};
+
+/** @brief 把分解结果摊平成「因式 + 重数」表；遇到超过二次的因子返回 false。 */
+bool collectFractionFactors(const Ptr &factored, std::uint32_t variable,
+                            Memory::Vector<FractionFactor> *out) {
+    if (!factored) return false;
+    Memory::Vector<Ptr> pieces;
+    if (factored->kind() == NodeKind::Mul) {
+        for (NodePtr child : factored->operands()) pieces.push_back(Ptr::borrow(child));
+    } else {
+        pieces.push_back(factored);
+    }
+    for (const Ptr &piece : pieces) {
+        Ptr base = piece;
+        int repeat = 1;
+        if (piece->kind() == NodeKind::Pow) {
+            Ptr exponent = Ptr::borrow(piece->operand(1));
+            long long value = 0;
+            if (exponent->isSmallInteger(&value) && value >= 1) {
+                repeat = static_cast<int>(value);
+                base = Ptr::borrow(piece->operand(0));
+            }
+        }
+        UnivariatePoly polynomial;
+        if (!toPolynomial(base.get(), variable, &polynomial) || polynomial.degree() < 1) return false;
+        if (polynomial.degree() > 2) return false;
+        FractionFactor entry;
+        entry.base = base;
+        entry.multiplicity = repeat;
+        entry.degree = polynomial.degree();
+        out->push_back(entry);
+    }
+    return true;
+}
+
+/**
+ * @brief 线性因子的部分分式项 `A / f^k` 的积分。
+ *
+ * `k = 1` 给 `A·ln|f|/a`；`k > 1` 给 `A·f^(1-k)/(a(1-k))`。
+ */
+Ptr integrateLinearFactorTerm(const Ptr &coefficient, const Ptr &base, int power, std::uint32_t variable) {
+    UnivariatePoly polynomial;
+    if (!toPolynomial(base.get(), variable, &polynomial)) return Ptr();
+    const Ptr slope = polynomial.degree() >= 1 ? polynomial.coefficient(1) : integer(0);
+    if (slope->isZero()) return Ptr();
+    if (power == 1) {
+        Memory::Vector<NodePtr> arguments;
+        arguments.push_back(base.get());
+        Ptr logarithm = Ptr(Node::makeFunction("log", arguments));
+        return makeDivide(makeMul(coefficient, logarithm), slope);
+    }
+    const long long next = 1 - static_cast<long long>(power);
+    Ptr powered = makePow(base, integer(next));
+    if (!powered) return Ptr();
+    return makeDivide(makeMul(coefficient, powered), makeMul(slope, integer(next)));
+}
+
+/**
+ * @brief 不可约二次因子的部分分式项 `(p·x + q)/f` 的积分。
+ *
+ * 拆成 `(p/2a)·f'/f` 与常数项的 `K/((x+h)² + k²)`：
+ * 前者给对数，后者给 `atan`。
+ */
+Ptr integrateQuadraticFactorTerm(const Ptr &numeratorExpression, const Ptr &base, std::uint32_t variable) {
+    UnivariatePoly basePoly, numeratorPoly;
+    if (!toPolynomial(base.get(), variable, &basePoly)) return Ptr();
+    if (!toPolynomial(numeratorExpression.get(), variable, &numeratorPoly)) return Ptr();
+    if (basePoly.degree() != 2) return Ptr();
+
+    const Ptr a = basePoly.coefficient(2);
+    const Ptr b = basePoly.coefficient(1);
+    const Ptr c = basePoly.coefficient(0);
+    const Ptr p = numeratorPoly.degree() >= 1 ? numeratorPoly.coefficient(1) : integer(0);
+    const Ptr q = numeratorPoly.coefficient(0);
+    Ptr x = variableNode(variable);
+
+    // 对数部分：(p/(2a))·ln|f|
+    Ptr logPart = Ptr();
+    if (!p->isZero()) {
+        Memory::Vector<NodePtr> arguments;
+        arguments.push_back(base.get());
+        Ptr logarithm = Ptr(Node::makeFunction("log", arguments));
+        logPart = makeDivide(makeMul(p, logarithm), makeMul(integer(2), a));
+    }
+
+    // atan 部分：剩余常数项 K = q - p·b/(2a)，∫K/(a((x+h)²+k²)) = K/(a·k)·atan((x+h)/k)
+    Ptr residual = makeAdd(q, makeNegate(makeDivide(makeMul(p, b), makeMul(integer(2), a))));
+    residual = simplify(residual);
+    Ptr atanPart = Ptr();
+    if (residual && !residual->isZero()) {
+        // k² = c/a - b²/(4a²)，即 (4ac - b²)/(4a²)
+        Ptr kSquared = makeAdd(makeDivide(c, a),
+                               makeNegate(makeDivide(makePow(b, integer(2)),
+                                                     makeMul(integer(4), makePow(a, integer(2))))));
+        kSquared = simplify(kSquared);
+        Ptr k = makePow(kSquared, makeNumber(BigInt(1), BigInt(2)));
+        if (!k || k->isZero()) return Ptr();
+        Ptr halfB = makeDivide(b, makeMul(integer(2), a));
+        Ptr shifted = makeAdd(x.share(), halfB);
+        Ptr argument = makeDivide(shifted, k);
+        if (!argument) return Ptr();
+        Memory::Vector<NodePtr> atanArgs;
+        atanArgs.push_back(argument.get());
+        Ptr atanFunction = Ptr(Node::makeFunction("atan", atanArgs));
+        atanPart = makeDivide(makeMul(residual, atanFunction), makeMul(a, k));
+    }
+
+    if (logPart && atanPart) return makeAdd(logPart, atanPart);
+    if (logPart) return logPart;
+    return atanPart;
+}
+
+/** @brief 分母分解后要设的一个待定系数（未知量的位置）。 */
+struct PartialTerm {
+    std::size_t factorIndex = 0;   ///< 属于第几个因式
+    int power = 1;                 ///< 该因式的幂次
+    int shift = 0;                 ///< 分子里 x 的幂次（0 表示常数 A，1 表示 A·x）
+};
+
+Ptr integratePartialFractions(const UnivariatePoly &numerator, const UnivariatePoly &denominator,
+                              std::uint32_t variable) {
+    if (numerator.degree() >= denominator.degree()) return Ptr();
+    Ptr factored = factor(fromPolynomial(denominator));
+    if (!factored) return Ptr();
+    Memory::Vector<FractionFactor> factors;
+    if (!collectFractionFactors(factored, variable, &factors)) return Ptr();
+    if (factors.empty()) return Ptr();
+
+    // 分母本身就是单个不可约二次因式（无重数）：直接走二次分母公式
+    if (factors.size() == 1 && factors[0].multiplicity == 1 && factors[0].degree == 2) {
+        return integrateQuadraticFactorTerm(fromPolynomial(numerator), factors[0].base, variable);
+    }
+    // 二次因式带重数：需要降幂递推，暂不支持
+    for (const FractionFactor &entry : factors) {
+        if (entry.degree == 2 && entry.multiplicity > 1) return Ptr();
+    }
+
+    // 设每个部分分式项的分子：一次因子给常数 A；二次因子给 A·x + B
+    std::vector<PartialTerm> terms;
+    for (std::size_t i = 0; i < factors.size(); ++i) {
+        for (int power = 1; power <= factors[i].multiplicity; ++power) {
+            PartialTerm term;
+            term.factorIndex = i;
+            term.power = power;
+            if (factors[i].degree == 2) {
+                term.shift = 1;
+                terms.push_back(term);   // A·x
+                term.shift = 0;
+                terms.push_back(term);   // B
+            } else {
+                term.shift = 0;
+                terms.push_back(term);
+            }
+        }
+    }
+    const std::size_t unknownCount = terms.size();
+
+    Memory::Vector<std::uint32_t> symbols;
+    Memory::Vector<Ptr> symbolNodes;
+    for (std::size_t i = 0; i < unknownCount; ++i) {
+        const std::uint32_t id = internSymbol("c" + std::to_string(i) + "x");
+        symbols.push_back(id);
+        symbolNodes.push_back(Ptr(Node::makeSymbolById(id)));
+    }
+
+    // 两边乘回 Q：Σ Aᵢ·(Q/fᵢ^k)·x^shift = P
+    Ptr combination = integer(0);
+    for (std::size_t i = 0; i < terms.size(); ++i) {
+        const PartialTerm &term = terms[i];
+        const FractionFactor &owner = factors[term.factorIndex];
+        Ptr cofactor = integer(1);
+        for (const FractionFactor &other : factors) {
+            int exponent = other.multiplicity;
+            if (other.base->equals(owner.base.get())) exponent = other.multiplicity - term.power;
+            if (exponent > 0) cofactor = makeMul(cofactor, makePow(other.base, integer(exponent)));
+        }
+        if (term.shift > 0) cofactor = makeMul(cofactor, makePow(variableNode(variable), integer(term.shift)));
+        combination = makeAdd(combination, makeMul(symbolNodes[i], cofactor));
+    }
+    Ptr plain = expand(makeAdd(combination, makeNegate(fromPolynomial(numerator))));
+    if (!plain) return Ptr();
+
+    // 按变量幂次收集线性方程组
+    UnivariatePoly equation;
+    if (!toPolynomial(plain.get(), variable, &equation)) return Ptr();
+    const std::size_t rows = equation.degree() + 1;
+
+    // 每个系数按未知符号线性拆分：逐符号求偏置
+    std::vector<std::vector<Ptr>> system(rows, std::vector<Ptr>(unknownCount, integer(0)));
+    std::vector<Ptr> constants(rows, integer(0));
+    for (std::size_t row = 0; row < rows; ++row) {
+        Ptr coefficient = simplify(equation.coefficient(row));
+        if (!coefficient) return Ptr();
+        Memory::Vector<Ptr> parts;
+        Ptr expanded = expand(coefficient);
+        if (expanded && expanded->kind() == NodeKind::Add) {
+            for (NodePtr child : expanded->operands()) parts.push_back(Ptr::borrow(child));
+        } else {
+            parts.push_back(coefficient);
+        }
+        for (const Ptr &part : parts) {
+            bool matched = false;
+            for (std::size_t col = 0; col < unknownCount; ++col) {
+                if (!dependsOn(part.get(), symbols[col])) continue;
+                Ptr quotient = makeDivide(part, symbolNodes[col]);
+                Ptr value = quotient ? simplify(quotient) : Ptr();
+                if (!value || dependsOn(value.get(), symbols[col])) return Ptr();
+                system[row][col] = makeAdd(system[row][col], value);
+                matched = true;
+                break;
+            }
+            if (!matched) constants[row] = makeAdd(constants[row], part);
+        }
+    }
+
+    // 高斯消元
+    std::vector<std::size_t> pivotColumns;
+    std::size_t pivotRow = 0;
+    for (std::size_t col = 0; col < unknownCount && pivotRow < rows; ++col) {
+        std::size_t chosen = rows;
+        for (std::size_t row = pivotRow; row < rows; ++row) {
+            if (!system[row][col]->isZero()) {
+                chosen = row;
+                break;
+            }
+        }
+        if (chosen == rows) continue;
+        std::swap(system[chosen], system[pivotRow]);
+        std::swap(constants[chosen], constants[pivotRow]);
+        const Ptr pivot = system[pivotRow][col];
+        for (std::size_t k = col; k < unknownCount; ++k) {
+            system[pivotRow][k] = simplify(makeDivide(system[pivotRow][k], pivot));
+        }
+        constants[pivotRow] = simplify(makeDivide(constants[pivotRow], pivot));
+        for (std::size_t row = 0; row < rows; ++row) {
+            if (row == pivotRow || system[row][col]->isZero()) continue;
+            const Ptr scale = system[row][col];
+            for (std::size_t k = col; k < unknownCount; ++k) {
+                system[row][k] =
+                    simplify(makeAdd(system[row][k], makeNegate(makeMul(scale, system[pivotRow][k]))));
+            }
+            constants[row] =
+                simplify(makeAdd(constants[row], makeNegate(makeMul(scale, constants[pivotRow]))));
+        }
+        pivotColumns.push_back(col);
+        ++pivotRow;
+    }
+    if (pivotColumns.size() != unknownCount) return Ptr();
+
+    std::vector<Ptr> values(unknownCount, integer(0));
+    for (std::size_t i = 0; i < pivotColumns.size(); ++i) {
+        values[pivotColumns[i]] = simplify(makeNegate(constants[i]));
+    }
+
+    // 逐项积分
+    Ptr result = integer(0);
+    std::size_t cursor = 0;
+    for (std::size_t i = 0; i < factors.size(); ++i) {
+        const FractionFactor &entry = factors[i];
+        for (int power = 1; power <= entry.multiplicity; ++power) {
+            if (entry.degree == 2) {
+                // 该项占两个未知量：A·x + B
+                Ptr first = values[cursor];
+                Ptr second = values[cursor + 1];
+                cursor += 2;
+                Ptr numeratorExpression = makeAdd(makeMul(first, variableNode(variable)), second);
+                if (numeratorExpression && !(first->isZero() && second->isZero())) {
+                    Ptr piece = integrateQuadraticFactorTerm(numeratorExpression, entry.base, variable);
+                    if (!piece) return Ptr();
+                    result = makeAdd(result, piece);
+                }
+            } else {
+                const Ptr coefficient = values[cursor];
+                ++cursor;
+                if (!coefficient || coefficient->isZero()) continue;
+                Ptr piece = integrateLinearFactorTerm(coefficient, entry.base, power, variable);
+                if (!piece) return Ptr();
+                result = makeAdd(result, piece);
+            }
+        }
+    }
+    return simplify(result);
+}
+
+/* ---------------------------------------------- 三角有理式（万能代换） */
+
+/** @brief 把 `sin(u)`/`cos(u)`/`tan(u)` 的实参收集出来（要求含 variable）。 */
+bool trigonometricKernel(const Ptr &expression, std::uint32_t variable, Ptr *kernel, bool *hasFunctions) {
+    *hasFunctions = false;
+    Memory::Vector<Ptr> kernels;
+    std::function<bool(const Ptr &)> walk = [&](const Ptr &node) {
+        if (!node) return false;
+        if (node->kind() == NodeKind::Add || node->kind() == NodeKind::Mul) {
+            for (NodePtr child : node->operands()) {
+                if (!walk(Ptr::borrow(child))) return false;
+            }
+            return true;
+        }
+        if (node->kind() == NodeKind::Pow) {
+            return walk(Ptr::borrow(node->operand(0))) && walk(Ptr::borrow(node->operand(1)));
+        }
+        if (node->kind() == NodeKind::Function) {
+            const char *name = node->name();
+            if (name && (std::strcmp(name, "sin") == 0 || std::strcmp(name, "cos") == 0 ||
+                         std::strcmp(name, "tan") == 0)) {
+                Ptr argument = Ptr::borrow(node->operand(0));
+                if (!argument || !dependsOn(argument.get(), variable)) return false;
+                *hasFunctions = true;
+                bool known = false;
+                for (const Ptr &existing : kernels) {
+                    if (existing->equals(argument.get())) { known = true; break; }
+                }
+                if (!known) kernels.push_back(argument);
+                return walk(argument);
+            }
+            // 其它函数一律视为不可代换（如 sin(x)·log(x) 不在万能代换范围内）
+            return true;
+        }
+        return true;
+    };
+    if (!walk(expression)) return false;
+    if (!*hasFunctions || kernels.empty()) return false;
+    // 只处理同一个内核的情形：sin(2x) 与 sin(x) 混在一起时不套用
+    for (std::size_t i = 1; i < kernels.size(); ++i) {
+        if (!kernels[i]->equals(kernels[0].get())) return false;
+    }
+    *kernel = kernels.front();
+    return true;
+}
+
+/**
+ * @brief 万能代换 `t = tan(u/2)` 求解 `∫ R(sin u, cos u, tan u) du`。
+ *
+ * 用 `sin u = 2t/(1+t²)`、`cos u = (1-t²)/(1+t²)`、`du = 2dt/(1+t²)` 把三角有理式
+ * 变成 t 的有理函数再积分，最后把 t 换回 `tan(u/2)`。要求内核是 `a·x+b`，
+ * 这样 `du/dx = a` 是常数。
+ */
+Ptr integrateTrigonometricRational(const Ptr &expression, std::uint32_t variable) {
+    Ptr kernel;
+    bool hasFunctions = false;
+    if (!trigonometricKernel(expression, variable, &kernel, &hasFunctions)) return Ptr();
+    if (!hasFunctions) return Ptr();
+
+    Ptr slope, offset;
+    if (!linearForm(kernel, variable, &slope, &offset) || slope->isZero()) return Ptr();
+
+    const std::uint32_t tSymbol = internSymbol("__t");
+    Ptr t = variableNode(tSymbol);
+    // sin u、cos u、tan u 的 t 表达式
+    Ptr onePlusT2 = makeAdd(integer(1), makePow(t, integer(2)));
+    Ptr sinU = makeDivide(makeMul(integer(2), t.share()), onePlusT2.share());
+    Ptr cosU = makeDivide(makeAdd(integer(1), makeNegate(makePow(t.share(), integer(2)))), onePlusT2.share());
+    Ptr tanU = makeDivide(makeMul(integer(2), t.share()),
+                          makeAdd(integer(1), makeNegate(makePow(t.share(), integer(2)))));
+    if (!sinU || !cosU || !tanU) return Ptr();
+
+    // 把 sin(kernel)→sinU、cos(kernel)→cosU、tan(kernel)→tanU 替换进去
+    Ptr replaced = expression.share();
+    // 从内核最具体的函数开始替换；replaceSubtree 只匹配整棵子树，安全
+    struct { const char *name; Ptr value; } table[] = {
+        {"sin", sinU}, {"cos", cosU}, {"tan", tanU},
+    };
+    for (const auto &entry : table) {
+        if (!dependsOn(replaced.get(), variable)) break;
+        // 逐个函数节点替换：直接对整棵表达式做子树替换，命中就换
+        Ptr target = Ptr(Node::makeFunction(entry.name, Memory::Vector<NodePtr>{kernel.get()}));
+        Ptr next = replaceSubtree(replaced, target, entry.value);
+        if (!next) return Ptr();
+        replaced = next;
+    }
+    if (dependsOn(replaced.get(), variable)) return Ptr();
+
+    // du = 2dt/(1+t²)，dx = du/slope；换成对 t 积分
+    Ptr integrand = makeDivide(makeMul(integer(2), replaced), onePlusT2.share());
+    integrand = makeDivide(integrand, slope);
+    // 代换后的形状是嵌套分式（`2/((t²+1)*(1 + (1-t²)/(t²+1)))`），
+    // 必须先通分化成单个分式，integrate 才能按有理函数处理。
+    Ptr combined = togetherDeep(integrand);
+    if (combined) integrand = combined;
+    Ptr anti = integrate(integrand, tSymbol);
+    if (!anti) return Ptr();
+
+    // t = tan(u/2) 回代
+    Ptr halfKernel = makeDivide(kernel, integer(2));
+    if (!halfKernel) return Ptr();
+    Ptr tanHalf = Ptr(Node::makeFunction("tan", Memory::Vector<NodePtr>{halfKernel.get()}));
+    if (!tanHalf) return Ptr();
+    return substitute(anti, tSymbol, tanHalf);
+}
+
 } // namespace
+
+/* ------------------------------------------------------ 根式三角代换 */
+
+/** @brief 前置声明：根式代换内部要递归调用积分主入口。 */
+Ptr integrate(const Ptr &expression, std::uint32_t variable);
+
+/**
+ * @brief 从表达式里找出所有 `sqrt(g)` 的实参（要求都是同一个 g 且含 variable）。
+ *
+ * 注意：`sqrt(g)` 在节点层是 `Pow(g, 1/2)`，打印器只是把它写成 `sqrt(...)`，
+ * 所以这里按「指数为 1/2 的幂」识别，而不是找名为 `sqrt` 的 Function。
+ */
+bool radicalKernel(const Ptr &expression, std::uint32_t variable, Ptr *kernel) {
+    Memory::Vector<Ptr> kernels;
+    std::function<bool(const Ptr &)> walk = [&](const Ptr &node) {
+        if (!node) return false;
+        if (node->kind() == NodeKind::Add || node->kind() == NodeKind::Mul) {
+            for (NodePtr child : node->operands()) {
+                if (!walk(Ptr::borrow(child))) return false;
+            }
+            return true;
+        }
+        if (node->kind() == NodeKind::Pow) {
+            Ptr base = Ptr::borrow(node->operand(0));
+            Ptr exponent = Ptr::borrow(node->operand(1));
+            // 1/√g 在节点层是 Pow(g, -1/2)（不是 1/Pow(g,1/2)），两种指数都算根式
+            BigInt top(0), bottom(1);
+            const bool halfPower = numberValue(exponent.get(), &top, &bottom) && top.abs() == BigInt(1) &&
+                                   bottom == BigInt(2);
+            if (halfPower && dependsOn(base.get(), variable)) {
+                for (const Ptr &existing : kernels) {
+                    if (!existing->equals(base.get())) return false;
+                }
+                kernels.push_back(base);
+                return walk(base);
+            }
+            return walk(base) && walk(exponent);
+        }
+        return true;
+    };
+    if (!walk(expression) || kernels.empty()) return false;
+    *kernel = kernels.front();
+    return true;
+}
+
+/**
+ * @brief 根式三角代换：把 `sqrt(a² − x²)` 一类换成三角式。
+ *
+ * 按 `g` 的形态挑代换：
+ * - `g = a² − x²` ⇒ `x = a·sin t`，`√g = a·cos t`，`dx = a·cos t dt`；
+ * - `g = a² + x²` ⇒ `x = a·tan t`，`√g = a/cos t`，`dx = a/sec²t dt`；
+ * - `g = x² − a²` ⇒ `x = a/cos t`，`√g = a·tan t`，`dx = a·sin t/cos²t dt`。
+ *
+ * 代换后按三角有理式继续积分，最后把 `t` 换回反三角表达式。
+ */
+Ptr integrateRadicalSubstitution(const Ptr &expression, std::uint32_t variable) {
+    Ptr kernel;
+    if (!radicalKernel(expression, variable, &kernel)) return Ptr();
+    Ptr expandedKernel = expand(kernel);
+    if (!expandedKernel) expandedKernel = kernel;
+    UnivariatePoly polynomial;
+    if (!toPolynomial(expandedKernel.get(), variable, &polynomial)) return Ptr();
+    if (polynomial.degree() != 2) return Ptr();
+    const Ptr quadratic = polynomial.coefficient(2);
+    const Ptr linearCoefficient = polynomial.coefficient(1);
+    const Ptr constantTerm = polynomial.coefficient(0);
+    if (!linearCoefficient->isZero()) return Ptr(); // 含 x 一次项时需先配方，暂不处理
+
+    const std::uint32_t tSymbol = internSymbol("__s");
+    Ptr t = Ptr(Node::makeSymbolById(tSymbol));
+    Ptr sine = Ptr(Node::makeFunction("sin", Memory::Vector<NodePtr>{t.get()}));
+    Ptr cosine = Ptr(Node::makeFunction("cos", Memory::Vector<NodePtr>{t.get()}));
+    Ptr tangent = Ptr(Node::makeFunction("tan", Memory::Vector<NodePtr>{t.get()}));
+    if (!sine || !cosine || !tangent) return Ptr();
+
+    // 判定形态：a²−x²（二次项系数 < 0）、a²+x²（> 0 且常数项 > 0）
+    double quadraticValue = 0.0, constantValue = 0.0;
+    BigInt numerator, denominator;
+    if (!numberValue(quadratic.get(), &numerator, &denominator)) return Ptr();
+    quadraticValue = numerator.toDouble() / denominator.toDouble();
+    if (!numberValue(constantTerm.get(), &numerator, &denominator)) return Ptr();
+    constantValue = numerator.toDouble() / denominator.toDouble();
+    if (quadraticValue > 0.0 && constantValue < 0.0) return Ptr(); // x²−a² 需要 a 的具体值
+
+    // a = √|常数项 / 二次项系数|：
+    // a² − x² 型常数项为正、二次项为负；a² + x² 型两者同号。
+    // 统一取绝对值，避免 a²+x² 情形算出 √(-1)。
+    Ptr ratio = makeDivide(constantTerm, quadratic);
+    ratio = simplify(ratio);
+    if (!ratio) return Ptr();
+    {
+        BigInt ratioTop(0), ratioBottom(1);
+        if (numberValue(ratio.get(), &ratioTop, &ratioBottom) && ratioTop.isNegative()) {
+            ratio = makeNegate(ratio);
+        }
+    }
+    Ptr a = makePow(ratio, makeNumber(BigInt(1), BigInt(2)));
+    if (!a) return Ptr();
+
+    Ptr substitution;
+    Ptr radicalAfter;
+    Ptr derivativeFactor;   // dx/dt
+    if (quadraticValue < 0.0) {
+        // x = a sin t ⇒ √g = a cos t，dx = a cos t dt
+        substitution = makeMul(a, sine);
+        radicalAfter = makeMul(a, cosine);
+        derivativeFactor = makeMul(a, cosine);
+    } else {
+        // x = a tan t ⇒ √g = a/cos t，dx = a/cos²t dt
+        substitution = makeMul(a, tangent);
+        radicalAfter = makeDivide(a, cosine);
+        Ptr cosineSquared = makePow(cosine, integer(2));
+        derivativeFactor = makeDivide(a, cosineSquared);
+    }
+    if (!substitution || !radicalAfter || !derivativeFactor) return Ptr();
+
+    // 先把根式节点换成代换后的形式，再把 x 换成 substitution。
+    // √g 与 1/√g 分别对应 Pow(g, 1/2) 与 Pow(g, -1/2)，两种都要处理。
+    Memory::Vector<Ptr> radicalNodes;
+    Ptr rootHalf = makePow(kernel, makeNumber(BigInt(1), BigInt(2)));
+    Ptr rootNegativeHalf = makePow(kernel, makeNumber(BigInt(-1), BigInt(2)));
+    if (!rootHalf || !rootNegativeHalf) return Ptr();
+    radicalNodes.push_back(rootHalf);
+    radicalNodes.push_back(rootNegativeHalf);
+    Ptr replaced = expression.share();
+    for (std::size_t i = 0; i < radicalNodes.size(); ++i) {
+        Ptr replacement = i == 0 ? radicalAfter : makeDivide(integer(1), radicalAfter);
+        if (!replacement) return Ptr();
+        Ptr next = replaceSubtree(replaced, radicalNodes[i], replacement);
+        if (!next) return Ptr();
+        replaced = next;
+    }
+    replaced = substitute(replaced, variable, substitution);
+    if (!replaced || dependsOn(replaced.get(), variable)) return Ptr();
+
+    Ptr integrand = makeMul(replaced, derivativeFactor);
+    Ptr combined = togetherDeep(integrand);
+    if (combined) integrand = combined;
+    Ptr anti = integrate(integrand, tSymbol);
+    if (!anti) return Ptr();
+
+    // t 回代：x = a sin t ⇒ t = asin(x/a)；x = a tan t ⇒ t = atan(x/a)
+    Ptr argument = makeDivide(variableNode(variable), a);
+    if (!argument) return Ptr();
+    const char *inverseName = quadraticValue < 0.0 ? "asin" : "atan";
+    Ptr inverse = Ptr(Node::makeFunction(inverseName, Memory::Vector<NodePtr>{argument.get()}));
+    if (!inverse) return Ptr();
+    return substitute(anti, tSymbol, inverse);
+}
 
 Ptr integrate(const Ptr &expression, std::uint32_t variable) {
     if (!expression) return Ptr();
@@ -717,71 +1346,77 @@ Ptr integrate(const Ptr &expression, std::uint32_t variable) {
     // 先把分式改写为幂形式
     Ptr result = integrateRecursive(simplified, variable);
     if (!result) {
-        // 有理函数：分子分母都是多项式，按次数分派
+        // 根式三角代换：√(a²−x²)、√(a²+x²) 一类
+        Ptr radical = integrateRadicalSubstitution(simplified, variable);
+        if (radical) return simplify(radical);
+    }
+    if (!result) {
+        // 三角有理式：万能代换 t = tan(u/2)
+        Ptr trigonometric = integrateTrigonometricRational(simplified, variable);
+        if (trigonometric) return simplify(trigonometric);
+    }
+    if (!result) {
+        // 有理函数：先用 toQuotient 化成规范的单分式 P/Q，再按次数分派。
+        // 旧实现手工拆 `Pow(Q, -1)` / `Mul`，遇到 `1/(Q^2)` 会丢掉指数
+        // （`∫dt/(t²+1)²` 被错当成 `∫dt/(t²+1)`），这里统一走规范形式。
         const auto symbols = freeSymbols(simplified.get());
         if (symbols.size() != 1) return Ptr();
-        Ptr expanded = expand(simplified);
+        Ptr top, bottom;
+        if (!toQuotient(simplified, &top, &bottom)) return Ptr();
+        if (isInt(bottom, 1)) return Ptr();
+        Ptr numeratorExpression = expand(top);
+        Ptr denominatorExpression = expand(bottom);
+        if (!numeratorExpression || !denominatorExpression) return Ptr();
+        // 先约掉公因式，避免分母带重复因子后分解困难
+        Ptr reduced = cancelCommon(numeratorExpression, denominatorExpression, variable);
+        if (reduced) {
+            Ptr reducedTop, reducedBottom;
+            if (toQuotient(reduced, &reducedTop, &reducedBottom)) {
+                if (isInt(reducedBottom, 1)) {
+                    Ptr simplifiedReduced = simplify(reducedTop);
+                    if (!simplifiedReduced) return Ptr();
+                    Ptr direct = integrateRecursive(simplifiedReduced, variable);
+                    if (direct) return simplify(direct);
+                }
+                Ptr expandedTop = expand(reducedTop);
+                Ptr expandedBottom = expand(reducedBottom);
+                if (expandedTop) numeratorExpression = expandedTop;
+                if (expandedBottom) denominatorExpression = expandedBottom;
+            }
+        }
         UnivariatePoly numerator, denominator;
-        Ptr bottom;
-        // 化简常把 1/Q 直接写成 Q^(-1)（Pow 而非 Mul），两种形态都要认
-        if (expanded && expanded->kind() == NodeKind::Pow) {
-            Ptr exponent = Ptr::borrow(expanded->operand(1));
-            if (exponent->isNumber() && exponent->isNegative()) bottom = Ptr::borrow(expanded->operand(0));
-        } else if (expanded && expanded->kind() == NodeKind::Mul) {
-            for (NodePtr child : expanded->operands()) {
-                Ptr factor(child);
-                Node::retain(child);
-                if (factor->kind() == NodeKind::Pow) {
-                    Ptr exponent = Ptr::borrow(factor->operand(1));
-                    if (isInt(exponent, -1)) bottom = Ptr::borrow(factor->operand(0));
-                }
-            }
-        }
-        if (!bottom || !toPolynomial(bottom.get(), variable, &denominator)) return Ptr();
+        if (!toPolynomial(numeratorExpression.get(), variable, &numerator)) return Ptr();
+        if (!toPolynomial(denominatorExpression.get(), variable, &denominator)) return Ptr();
+        if (denominator.isZero()) return Ptr();
 
-        // 分子：Pow 形式的分子固定为 1；Mul 形式要把非分母因子收集起来
-        if (expanded->kind() == NodeKind::Pow) {
-            numerator = UnivariatePoly{};
-            numerator.variable = variable;
-            numerator.coefficients.push_back(integer(1));
-        } else {
-            Ptr rest = integer(1);
-            for (NodePtr child : expanded->operands()) {
-                Ptr factor(child);
-                Node::retain(child);
-                bool isDenominator = false;
-                if (factor->kind() == NodeKind::Pow) {
-                    Ptr exponent = Ptr::borrow(factor->operand(1));
-                    if (isInt(exponent, -1)) isDenominator = true;
-                }
-                if (!isDenominator) rest = makeMul(rest, factor);
-            }
-            if (!toPolynomial(rest.get(), variable, &numerator)) return Ptr();
+        // 真分式部分：先做多项式除法拆出整式
+        UnivariatePoly quotientPart, remainderPart;
+        if (!polyDivide(numerator, denominator, &quotientPart, &remainderPart)) return Ptr();
+        Ptr polynomialPart = integer(0);
+        for (std::size_t i = 1; i < quotientPart.coefficients.size(); ++i) {
+            Ptr term = makeMul(
+                quotientPart.coefficient(i),
+                makePow(variableNode(variable), integer(static_cast<long long>(i - 1))));
+            polynomialPart = makeAdd(polynomialPart, makeDivide(term, integer(static_cast<long long>(i))));
         }
 
+        if (remainderPart.isZero()) return simplify(polynomialPart);
+
+        Ptr remainderResult = Ptr();
         if (denominator.degree() == 1) {
-            // ∫ P(x)/(a x + b) dx：先做多项式除法再积分
-            UnivariatePoly q, r;
-            if (!polyDivide(numerator, denominator, &q, &r)) return Ptr();
-            Ptr polynomialPart = integer(0);
-            for (std::size_t i = 0; i < q.coefficients.size(); ++i) {
-                if (i == 0) continue;
-                Ptr term = makeMul(
-                    q.coefficient(i),
-                    makePow(variableNode(variable), integer(static_cast<long long>(i - 1))));
-                polynomialPart = makeAdd(polynomialPart, makeDivide(term, integer(static_cast<long long>(i))));
-            }
+            // ∫ R/(a x + b) dx = R·ln|ax+b|/a（R 必为常数）
             Ptr slope = denominator.coefficient(1);
             Memory::Vector<NodePtr> arguments;
-            arguments.push_back(bottom.get());
+            arguments.push_back(denominatorExpression.get());
             Ptr logarithm = Ptr(Node::makeFunction("log", arguments));
-            Ptr logPart = makeDivide(makeMul(r.coefficient(0), logarithm), slope);
-            return simplify(makeAdd(polynomialPart, logPart));
+            remainderResult = makeDivide(makeMul(remainderPart.coefficient(0), logarithm), slope);
+        } else if (denominator.degree() == 2) {
+            remainderResult = integrateQuadraticDenominator(remainderPart, denominator, variable);
+        } else {
+            remainderResult = integratePartialFractions(remainderPart, denominator, variable);
         }
-        if (denominator.degree() == 2) {
-            return integrateQuadraticDenominator(numerator, denominator, variable);
-        }
-        return Ptr();
+        if (!remainderResult) return Ptr();
+        return simplify(makeAdd(polynomialPart, remainderResult));
     }
     // 分部积分等路径常留下括号，展开再化简成多项式形态
     Ptr expanded = expand(result);
@@ -885,12 +1520,31 @@ Ptr cancelAtPoint(const Ptr &expression, std::uint32_t variable, const Ptr &poin
 Ptr lHopital(const Ptr &expression, std::uint32_t variable, const Ptr &point, int depth);
 Ptr unresolvedLimit(const Ptr &expression, std::uint32_t variable, const Ptr &point);
 
+/**
+ * @brief 幂指型未定式 `F(x)^G(x)`：改写成 `e^{G·ln F}` 再取极限。
+ *
+ * 覆盖 1^∞、0^0、∞^0 三类：底数与指数都随 x 变化时，先求
+ * `L = lim G·ln F`，答案即 `e^L`。`F` 必须为正（实值意义下），
+ * 若 `ln F` 的极限求不出就放弃，交回普通通路。
+ *
+ * 只在「底数与指数都含变量」时启动，避免把 `x^2`、`2^x` 这类
+ * 有直接结果的幂也绕一遍指数-对数。
+ */
+Ptr limitPowerForm(const Ptr &expression, std::uint32_t variable, const Ptr &point);
+
 Ptr limit(const Ptr &expression, std::uint32_t variable, const Ptr &point) {
     if (!expression) return Ptr();
 
     // 无穷极限单独处理：`-oo` 会被解析成 Mul(-1, Infinity)，两种形态都要认
-    if (isPositiveInfinity(point)) return limitAtInfinity(expression, variable, true);
+    if (isPositiveInfinity(point)) {
+        // 先试幂指型（1^∞ 这类在无穷处也可能出现）
+        if (Ptr power = limitPowerForm(expression, variable, point)) return power;
+        return limitAtInfinity(expression, variable, true);
+    }
     if (isNegativeInfinity(point)) return limitAtInfinity(expression, variable, false);
+
+    // 幂指型未定式 F(x)^G(x)：底数与指数都随 x 变（1^∞、0^0、∞^0）
+    if (Ptr power = limitPowerForm(expression, variable, point)) return power;
 
     // 直接代入：用分子/分母分别求值判定是否未定式
     const Ptr simplified = simplify(expression);
@@ -1095,6 +1749,40 @@ Ptr lHopital(const Ptr &expression, std::uint32_t variable, const Ptr &point, in
 }
 
 /**
+ * @brief 幂指型未定式 `F^G` 的极限：`e^{G·ln F}`。
+ */
+Ptr limitPowerForm(const Ptr &expression, std::uint32_t variable, const Ptr &point) {
+    if (!expression) return Ptr();
+    Ptr base, exponent;
+    if (expression->kind() != NodeKind::Pow) return Ptr();
+    base = Ptr::borrow(expression->operand(0));
+    exponent = Ptr::borrow(expression->operand(1));
+    if (!base || !exponent) return Ptr();
+    if (!dependsOn(base.get(), variable) || !dependsOn(exponent.get(), variable)) return Ptr();
+
+    // L = lim G·ln F
+    Memory::Vector<NodePtr> logArguments;
+    logArguments.push_back(base.get());
+    Ptr logarithm = Ptr(Node::makeFunction("log", logArguments));
+    if (!logarithm) return Ptr();
+    Ptr product = makeMul(exponent, logarithm);
+    if (!product) return Ptr();
+    Ptr exponentLimit = limit(product, variable, point);
+    if (!exponentLimit) return Ptr();
+    if (containsInfinity(exponentLimit.get())) {
+        // e^∞ = ∞，e^-∞ = 0
+        Ptr sign = simplify(exponentLimit);
+        if (sign && sign->kind() == NodeKind::Constant &&
+            sign->constant() == ConstantId::NegativeInfinity) {
+            return integer(0);
+        }
+        return Ptr(Node::makeConstant(ConstantId::Infinity));
+    }
+    Ptr result = makePow(Ptr(Node::makeConstant(ConstantId::E)), exponentLimit);
+    return result ? simplify(result) : Ptr();
+}
+
+/**
  * @brief 洛必达不适用时的兜底：用 Taylor 展开取首个非零项之商。
  *
  * 对 `sin x / x`、`(1-cos x)/x^2`、`(e^x-1-x)/x^2` 这类题全部有效：
@@ -1196,24 +1884,106 @@ Ptr limitAtInfinity(const Ptr &expression, std::uint32_t variable, bool positive
         if (!positive && (degree % 2 == 1)) sign = !sign;
         return Ptr(Node::makeConstant(sign ? ConstantId::Infinity : ConstantId::NegativeInfinity));
     }
+
+    // 兜底：换元 t = 1/x，把 x→∞ 转成 t→0⁺ 再求
+    // （x·ln(1+1/x)、x·sin(1/x) 这类"无穷 × 无穷小"全走这条路）
+    {
+        const std::uint32_t tSymbol = internSymbol("__t");
+        Ptr t = Ptr(Node::makeSymbolById(tSymbol));
+        Ptr reciprocal = makeDivide(integer(1), t);
+        if (reciprocal) {
+            // 先把 x 换成 1/t，结果里只剩 t（`simplify` 会把 1/(1/t) 收成 t）
+            Ptr transformed = substitute(expression, variable, reciprocal);
+            if (transformed) {
+                Ptr simplifiedTransformed = simplify(transformed);
+                if (simplifiedTransformed && !dependsOn(simplifiedTransformed.get(), variable) &&
+                    !containsInfinity(simplifiedTransformed.get())) {
+                    Ptr value = limit(simplifiedTransformed, tSymbol, integer(0));
+                    if (value && !containsInfinity(value.get()) &&
+                        !dependsOn(value.get(), tSymbol)) {
+                        return value;
+                    }
+                }
+            }
+        }
+    }
     return Ptr();
 }
 
 /* ---------------------------------------------------------- Taylor */
 
+namespace {
+
+/** @brief 在 point 处求值并判断是否"干净"（有限、无除零、无 0^负数）。 */
+bool evaluatesCleanly(const Ptr &expression, std::uint32_t variable, const Ptr &point, Ptr *value) {
+    Ptr substituted = substitute(expression, variable, point);
+    if (!substituted) return false;
+    Ptr result = simplify(substituted);
+    if (!result) return false;
+    if (containsInfinity(result.get())) return false;
+    // 仍含 0^负数 说明除零
+    std::function<bool(const Ptr &)> hasZeroNegativePower = [&](const Ptr &node) {
+        if (!node) return false;
+        if (node->kind() == NodeKind::Pow) {
+            Ptr base = Ptr::borrow(node->operand(0));
+            Ptr exponent = Ptr::borrow(node->operand(1));
+            if (base->isZero() && exponent->isNumber() && exponent->isNegative()) return true;
+        }
+        for (NodePtr child : node->operands()) {
+            if (hasZeroNegativePower(Ptr::borrow(child))) return true;
+        }
+        return false;
+    };
+    if (hasZeroNegativePower(result)) return false;
+    *value = result;
+    return true;
+}
+
+} // namespace
+
+/**
+ * @brief Taylor / Laurent 展开。
+ *
+ * 常规路径按 `f^(k)(a)/k!·(x−a)^k` 逐阶求导。若 `f` 在 `a` 处奇异
+ * （`1/x`、`sin(x)/x`、`1/sin(x)` 这类），先用 `(x−a)^k` 乘到不再奇异，
+ * 展开后再除回去，得到 Laurent 展开（含负幂项）。
+ *
+ * @param order 展开到的最高阶（对 Laurent 展开指「非负部分」的最高阶）。
+ */
 Ptr taylorExpand(const Ptr &expression, std::uint32_t variable, const Ptr &point, int order) {
     if (!expression || order < 0) return Ptr();
     Ptr variableNodePtr = variableNode(variable);
+    Ptr shifted = makeAdd(variableNodePtr.share(), makeNegate(point));
+    if (!shifted) return Ptr();
+
+    // 先看能否直接展开；不能则试着乘掉奇点
+    Ptr working = expression.share();
+    long long poleOrder = 0;
+    {
+        Ptr probe;
+        if (!evaluatesCleanly(working, variable, point, &probe)) {
+            // 逐次乘 (x−a)，最多 8 次（超过说明不是极点而是本性奇点）
+            for (int attempt = 1; attempt <= 8; ++attempt) {
+                working = simplify(makeMul(working, shifted));
+                if (!working) return Ptr();
+                Ptr value;
+                if (evaluatesCleanly(working, variable, point, &value)) {
+                    poleOrder = attempt;
+                    break;
+                }
+            }
+            if (poleOrder == 0) return Ptr();
+        }
+    }
 
     Ptr result = integer(0);
-    Ptr current = expression.share();
+    Ptr current = working.share();
     BigInt factorial(1);
 
     for (int k = 0; k <= order; ++k) {
-        Ptr value = substitute(current, variable, point);
-        if (!value) return Ptr();
+        Ptr value;
+        if (!evaluatesCleanly(current, variable, point, &value)) return Ptr();
         if (k > 0) factorial = factorial * BigInt(k);
-        Ptr shifted = makeAdd(variableNodePtr.share(), makeNegate(point));
         Ptr term = makeDivide(makeMul(value, makePow(shifted, integer(k))), makeNumber(factorial, BigInt(1)));
         result = makeAdd(result, term);
 
@@ -1222,7 +1992,104 @@ Ptr taylorExpand(const Ptr &expression, std::uint32_t variable, const Ptr &point
             if (!current) return Ptr();
         }
     }
+    // 抵消之前乘上的 (x−a)^poleOrder：逐项除，结果才是「按 (x−a) 的幂次」展开的形态
+    if (poleOrder > 0) {
+        Memory::Vector<Ptr> pieces;
+        if (result->kind() == NodeKind::Add) {
+            for (NodePtr child : result->operands()) pieces.push_back(Ptr::borrow(child));
+        } else {
+            pieces.push_back(result);
+        }
+        Memory::Vector<Ptr> holders;
+        for (const Ptr &piece : pieces) {
+            Ptr divided = makeDivide(piece, makePow(shifted, integer(poleOrder)));
+            if (!divided) return Ptr();
+            holders.push_back(divided);
+        }
+        Memory::Vector<NodePtr> operands;
+        for (const Ptr &holder : holders) operands.push_back(holder.get());
+        result = makeAddMany(operands);
+        if (!result) return Ptr();
+    }
     return simplify(result);
+}
+
+/* ------------------------------------------------------ 驻点与极值 */
+
+const char *criticalKindName(CriticalKind kind) {
+    switch (kind) {
+    case CriticalKind::Minimum: return "极小值";
+    case CriticalKind::Maximum: return "极大值";
+    case CriticalKind::Inflection: return "非极值（拐点）";
+    case CriticalKind::Unknown:
+    default: return "无法判定";
+    }
+}
+
+namespace {
+
+/**
+ * @brief 化简一个不再含自由变量的常数表达式。
+ *
+ * 先走通用化简，再用三角化简折叠特殊角（`acos(0)` → `1/2*pi`），
+ * 最后再化简一次，这样 `sin` 一类驻点的位置能直接落到闭式数值上。
+ */
+Ptr refineConstant(const Ptr &expression) {
+    if (!expression) return Ptr();
+    Ptr value = simplify(expression);
+    if (!value) value = expression.share();
+    Ptr folded = trigSimplify(value);
+    if (folded) value = folded;
+    Ptr again = simplify(value);
+    return again ? again : value;
+}
+
+} // namespace
+
+bool criticalPoints(const Ptr &expression, std::uint32_t variable,
+                    Memory::Vector<CriticalPoint> *points) {
+    if (!expression || !points) return false;
+    Ptr derivative = differentiate(expression, variable);
+    if (!derivative) return false;
+    Ptr slope = simplify(derivative);
+    if (!slope) return false;
+    if (!dependsOn(slope.get(), variable)) return false; // 常数斜率：没有驻点
+
+    Ptr zero = integer(0);
+    Memory::Vector<Solution> solutions;
+    if (!solve(slope.get(), zero.get(), variable, &solutions)) return false;
+    if (solutions.empty()) return false;
+
+    Ptr secondDerivative = differentiate(slope, variable);
+    Memory::Vector<Ptr> secondHolder;
+    if (secondDerivative) secondHolder.push_back(secondDerivative);
+
+    bool anyCollected = false;
+    for (const Solution &solution : solutions) {
+        if (!solution.value) continue;
+        CriticalPoint point;
+        // 求解器给出的根可能是 acos(0) 这类反三角形式，先折叠成 π/2 再参与后续计算。
+        point.location = refineConstant(solution.value);
+        if (!point.location) point.location = solution.value;
+        Ptr atPoint = substitute(expression, variable, point.location);
+        point.value = atPoint ? refineConstant(atPoint) : Ptr();
+        if (secondDerivative) {
+            Ptr curvature = substitute(secondDerivative, variable, point.location);
+            Ptr signedCurvature = curvature ? refineConstant(curvature) : Ptr();
+            if (signedCurvature && signedCurvature->isNumber()) {
+                if (signedCurvature->isZero()) {
+                    point.kind = CriticalKind::Unknown;
+                } else if (signedCurvature->isNegative()) {
+                    point.kind = CriticalKind::Maximum;
+                } else {
+                    point.kind = CriticalKind::Minimum;
+                }
+            }
+        }
+        points->push_back(point);
+        anyCollected = true;
+    }
+    return anyCollected;
 }
 
 /* ------------------------------------------------------------ 辅助 */

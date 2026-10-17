@@ -268,8 +268,10 @@ std::string textOf(const NodePtr &node, const PrintOptions &options, Precedence 
         // 开方：x^(1/2) → sqrt(x)
         if (exponent->isNumber() && !exponent->isInteger() && exponent->numerator().isOne() &&
             exponent->denominator() == BigInt(2)) {
-            const bool needsParen = precedenceOf(node->operand(0)) == Precedence::Add;
-            return "sqrt(" + (needsParen ? "(" + base + ")" : base) + ")";
+            // `sqrt(...)` 自带一层括号，而 base 已按 Pow 优先级求值
+            // （加法子式在那里就加过括号了），这里不能再补一层，否则
+            // 会打印成 sqrt(((-x^2 + 1)))。
+            return "sqrt(" + base + ")";
         }
         return base + "^" + exponentText(exponent, options);
     }

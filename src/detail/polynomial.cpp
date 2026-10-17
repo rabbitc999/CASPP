@@ -642,6 +642,142 @@ Ptr factor(const Ptr &expression) {
 
 /* -------------------------------------------------------- 通分与整理 */
 
+/** @brief `1/Q` 或 `top/Q` 形态拆成 (分子, 分母)；否则返回 false。 */
+bool splitFraction(const Ptr &node, Ptr *numerator, Ptr *denominator) {
+    if (!node) return false;
+    if (node->kind() == NodeKind::Pow) {
+        Ptr exponent = Ptr::borrow(node->operand(1));
+        if (exponent->isNumber() && exponent->isNegative()) {
+            *numerator = integer(1);
+            *denominator = makePow(Ptr::borrow(node->operand(0)), makeNegate(exponent));
+            return true;
+        }
+        return false;
+    }
+    if (node->kind() == NodeKind::Mul) {
+        Ptr top = integer(1), bottom = integer(1);
+        bool anyFraction = false;
+        for (NodePtr child : node->operands()) {
+            Ptr factor = Ptr::borrow(child);
+            Ptr innerTop, innerBottom;
+            if (splitFraction(factor, &innerTop, &innerBottom)) {
+                top = makeMul(top, innerTop);
+                bottom = makeMul(bottom, innerBottom);
+                anyFraction = true;
+            } else {
+                top = makeMul(top, factor);
+            }
+        }
+        if (!anyFraction) return false;
+        *numerator = top;
+        *denominator = bottom;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief 把任意表达式递归化成 `P/Q` 的规范形式（P、Q 里都不再含分式）。
+ *
+ * 递归规则：
+ * - `Mul`：逐因子拆成 `Pᵢ/Qᵢ`，分子连乘、分母连乘；
+ * - `Add`：各项统一到公分母，分子按公分母补齐；
+ * - `Pow`：指数为整数 n 时取 `(P/Q)^n`，n 为负则分子分母互换。
+ *
+ * 这条通路专门服务万能代换：`2/((t²+1)·((1−t²)/(t²+1)+1))` 的最外层是一个
+ * `Mul`，第二个因子是 `Pow(分母, -1)`，而分母自身还是 `Mul` + `Add` 的嵌套分式。
+ * 普通 `together` 只合并最外层的加法项，看不到里层结构。
+ */
+bool toQuotient(const Ptr &expression, Ptr *numerator, Ptr *denominator);
+
+bool toQuotient(const Ptr &expression, Ptr *numerator, Ptr *denominator) {
+    if (!expression) return false;
+
+    if (expression->kind() == NodeKind::Mul) {
+        Ptr top = integer(1), bottom = integer(1);
+        for (NodePtr child : expression->operands()) {
+            Ptr subTop, subBottom;
+            if (!toQuotient(Ptr::borrow(child), &subTop, &subBottom)) return false;
+            top = makeMul(top, subTop);
+            bottom = makeMul(bottom, subBottom);
+        }
+        *numerator = top;
+        *denominator = bottom;
+        return true;
+    }
+
+    if (expression->kind() == NodeKind::Add) {
+        Memory::Vector<Ptr> tops, bottoms;
+        for (NodePtr child : expression->operands()) {
+            Ptr subTop, subBottom;
+            if (!toQuotient(Ptr::borrow(child), &subTop, &subBottom)) return false;
+            tops.push_back(subTop);
+            bottoms.push_back(subBottom);
+        }
+        if (tops.empty()) {
+            *numerator = integer(0);
+            *denominator = integer(1);
+            return true;
+        }
+        Ptr common = integer(1);
+        for (const Ptr &piece : bottoms) common = makeMul(common, piece);
+        Ptr sum = integer(0);
+        for (std::size_t i = 0; i < tops.size(); ++i) {
+            Ptr scaled = tops[i];
+            for (std::size_t j = 0; j < bottoms.size(); ++j) {
+                if (i != j) scaled = makeMul(scaled, bottoms[j]);
+            }
+            sum = makeAdd(sum, scaled);
+        }
+        *numerator = sum;
+        *denominator = common;
+        return true;
+    }
+
+    if (expression->kind() == NodeKind::Pow) {
+        Ptr base = Ptr::borrow(expression->operand(0));
+        Ptr exponent = Ptr::borrow(expression->operand(1));
+        long long power = 0;
+        if (exponent->isSmallInteger(&power)) {
+            Ptr baseTop, baseBottom;
+            if (!toQuotient(base, &baseTop, &baseBottom)) return false;
+            const long long magnitude = power < 0 ? -power : power;
+            Ptr topPower = makePow(baseTop, integer(magnitude));
+            Ptr bottomPower = makePow(baseBottom, integer(magnitude));
+            if (!topPower || !bottomPower) return false;
+            if (power >= 0) {
+                *numerator = topPower;
+                *denominator = bottomPower;
+            } else {
+                *numerator = bottomPower;
+                *denominator = topPower;
+            }
+            return true;
+        }
+        // 非整数指数：底数若含分式则放弃（无法保持单分式形态）
+        Ptr baseTop, baseBottom;
+        if (!toQuotient(base, &baseTop, &baseBottom)) return false;
+        if (!isInt(baseBottom, 1)) return false;
+        *numerator = expression;
+        *denominator = integer(1);
+        return true;
+    }
+
+    *numerator = expression;
+    *denominator = integer(1);
+    return true;
+}
+
+Ptr togetherDeep(const Ptr &expression) {
+    Ptr simplified = simplify(expression);
+    if (!simplified) return Ptr();
+    Ptr numerator, denominator;
+    if (!toQuotient(simplified, &numerator, &denominator)) return together(simplified);
+    if (isInt(denominator, 1)) return simplified;
+    Ptr merged = makeDivide(numerator, denominator);
+    return merged ? merged : simplified;
+}
+
 Ptr together(const Ptr &expression) {
     Ptr simplified = simplify(expression);
     if (!simplified) return Ptr();

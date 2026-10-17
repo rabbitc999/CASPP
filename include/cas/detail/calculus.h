@@ -51,6 +51,38 @@ Ptr limitAtInfinity(const Ptr &expression, std::uint32_t variable, bool positive
 /** @brief 在 point 处展开到 order 阶，返回多项式。 */
 Ptr taylorExpand(const Ptr &expression, std::uint32_t variable, const Ptr &point, int order);
 
+/* ------------------------------------------------------ 驻点与极值 */
+
+/** @brief 驻点判定的结论。 */
+enum class CriticalKind {
+    Unknown,       ///< 无法判定（二阶导为 0 或无法求值）
+    Minimum,       ///< 极小值点
+    Maximum,       ///< 极大值点
+    Inflection,    ///< 非极值（拐点）
+};
+
+/** @brief 一个驻点。 */
+struct CriticalPoint {
+    Ptr location;                    ///< 驻点位置
+    Ptr value;                       ///< 该点的函数值
+    CriticalKind kind = CriticalKind::Unknown; ///< 极值类型（用二阶导判定）
+};
+
+/**
+ * @brief 求 f'(x) = 0 的全部实驻点，并用二阶导符号判定极值类型。
+ *
+ * 判定规则：`f''(a) > 0` 为极小、`< 0` 为极大、`= 0` 时无法判定（Unknown）。
+ * 求根复用方程求解器，因此覆盖多项式、可换元的高次方程与简单超越方程。
+ *
+ * @param points 输出驻点列表；无法求根时为空。
+ * @return 成功求出至少一个驻点返回 true。
+ */
+bool criticalPoints(const Ptr &expression, std::uint32_t variable,
+                    Memory::Vector<CriticalPoint> *points);
+
+/** @brief 极值类型的中文名，用于输出。 */
+const char *criticalKindName(CriticalKind kind);
+
 /* ------------------------------------------------------------ 辅助 */
 
 /** @brief 把变量代入表达式的值。 */
