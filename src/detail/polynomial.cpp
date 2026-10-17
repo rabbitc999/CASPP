@@ -1,6 +1,11 @@
 #include "cas/detail/polynomial.h"
+#include "cas/detail/calculus.h"
+#include "cas/detail/printer.h"
+#include <cstdio>
 
 #include <algorithm>
+#include <functional>
+#include <utility>
 
 namespace Cas::Detail {
 namespace {
@@ -405,6 +410,361 @@ Memory::Vector<Ptr> extractLinearFactors(UnivariatePoly *polynomial) {
     return factors;
 }
 
+/* ------------------------------------------------ 高次分解：结构识别 */
+
+/**
+ * @brief 偶次多项式在 `y = x²` 下可约时，把分解结果换回 x。
+ *
+ * `x^4+x^2+1`、`x^6-1`、`x^8-1` 的共同结构是"只含偶次项，且作为 y 的多项式能拆开"。
+ *
+ * 做法不做符号替换，而是直接在指数层面升次：y 上的因子 `Σ bᵢ·yⁱ`
+ * 对应 x 上的 `Σ bᵢ·x^(2i)`；升次后若还能继续分解，就继续拆。
+ *
+ * @param polynomial 待分解的多项式（成功时会被清空）
+ * @return 成功返回至少两个因子，否则返回空表示"这条规则不适用"。
+ */
+Memory::Vector<Ptr> factorByEvenSubstitution(UnivariatePoly *polynomial) {
+    Memory::Vector<Ptr> factors;
+    const std::size_t degree = polynomial->degree();
+    if (degree < 4 || degree % 2 != 0) return factors;
+
+    // 必须只含偶次项，才能写成 y = x² 的多项式
+    for (std::size_t index = 0; index <= degree; ++index) {
+        if (index % 2 != 0 && !polynomial->coefficient(index)->isZero()) return factors;
+    }
+
+    // 换元：把多项式按 `y = x²` 重写成 y 的多项式。
+    // 这里必须真的用独立符号 y 来构造，不能借用原变量——
+    // 否则后续无法区分"y 的幂"和"x 的幂"。
+    const std::uint32_t yId = internSymbol("__cas_y");
+    UnivariatePoly inY;
+    inY.variable = yId;
+    for (std::size_t index = 0; index <= degree / 2; ++index) {
+        inY.coefficients.push_back(polynomial->coefficient(index * 2));
+    }
+    inY.trim();
+    if (inY.degree() < 2) return factors;
+
+    // 先在 y 上分解。
+    Ptr originalInY = fromPolynomial(inY);
+    Ptr factoredY = factor(originalInY);
+    if (!factoredY) return factors;
+    {
+        PrintOptions po;
+        po.useUnicode = false;
+        if (toText(factoredY.get(), po) == toText(originalInY.get(), po)) return factors;
+    }
+
+    // 把 y 上的分解结果整体升次：y → x²。
+    // 注意这里不能再调用 factor（升次后仍可能是偶次式，会无限递归），
+    // 也不要无脑 expand——`(y+1)^2` 升次后是 `(x^2+1)^2`，
+    // 那本身就是一份完整的分解结果，展开反而把它揉回成加法。
+    Ptr replaced = substitute(factoredY, yId, makePow(Ptr(Node::makeSymbolById(polynomial->variable)),
+                                                      integer(2)));
+    if (!replaced) return Memory::Vector<Ptr>();
+
+    // 递归收集「乘积因子」：Mul 摊平，Pow 保留为整体（形如 (x^2+1)^2）
+    std::function<void(const Ptr &)> collect = [&](const Ptr &node) {
+        if (!node) return;
+        if (node->kind() == NodeKind::Mul) {
+            for (NodePtr inner : node->operands()) collect(Ptr::borrow(inner));
+            return;
+        }
+        // 单个加法因子（如 x^2-1）还能拆一次线性因子，这里只做局部提取，
+        // 不回调 factor，避免重新进入本函数。
+        UnivariatePoly piecePoly;
+        if (node->kind() == NodeKind::Add &&
+            toPolynomial(node.get(), polynomial->variable, &piecePoly) && piecePoly.degree() >= 2) {
+            const auto linear = extractLinearFactors(&piecePoly);
+            if (!linear.empty()) {
+                for (const Ptr &one : linear) factors.push_back(one);
+                if (piecePoly.degree() >= 1) factors.push_back(fromPolynomial(piecePoly));
+                return;
+            }
+        }
+        factors.push_back(node);
+    };
+    collect(replaced);
+
+    // 判据不是"因子数量 ≥ 2"——`(x^2+1)^2` 只有一个因子但确实是更细的形式。
+    // 改为比较升次结果与原式是否不同。
+    {
+        PrintOptions po;
+        po.useUnicode = false;
+        Ptr self = fromPolynomial(*polynomial);
+        if (toText(replaced.get(), po) == toText(self.get(), po)) return Memory::Vector<Ptr>();
+    }
+    if (factors.empty()) return Memory::Vector<Ptr>();
+
+    polynomial->coefficients.clear();
+    return factors;
+}
+
+/**
+ * @brief 识别符号表达式的完全平方，返回其平方根。
+ *
+ * 只处理几类常见形状，够多元二次分解用：
+ * - 单个 `Pow(base, 2)` → base
+ * - 乘积 `k · base²`（k 为完全平方有理数）→ √k · base
+ * - 已经是平方的乘法链 `a²·b²·…` → a·b·…
+ * 其余返回空，交给调用方当作"不可约"。
+ */
+Ptr sqrtOfSymbolicSquare(const Ptr &value) {
+    if (!value) return Ptr();
+
+    // 纯数值：交给有理数开方
+    if (value->isNumber()) {
+        BigInt numerator(0), denominator(1);
+        if (!rationalOf(value, &numerator, &denominator)) return Ptr();
+        if (numerator.isNegative()) return Ptr();
+        if (!numerator.isPerfectSquare() || !denominator.isPerfectSquare()) return Ptr();
+        return makeNumber(numerator.isqrt(), denominator.isqrt());
+    }
+
+    if (value->kind() == NodeKind::Pow) {
+        Ptr base = Ptr::borrow(value->operand(0));
+        Ptr exponent = Ptr::borrow(value->operand(1));
+        long long power = 0;
+        if (exponent->isSmallInteger(&power) && power >= 2 && power % 2 == 0) {
+            return makePow(base, integer(power / 2));
+        }
+        return Ptr();
+    }
+
+    if (value->kind() == NodeKind::Mul) {
+        // 逐个因子开方：每个因子都得是完全平方
+        Ptr product = integer(1);
+        for (NodePtr child : value->operands()) {
+            Ptr piece = sqrtOfSymbolicSquare(Ptr::borrow(child));
+            if (!piece) return Ptr();
+            Ptr merged = makeMul(product, piece);
+            if (!merged) return Ptr();
+            product = merged;
+        }
+        return product;
+    }
+    return Ptr();
+}
+
+/**
+ * @brief 把二次式拆成两个一次因子（需要判别式为完全平方数）。
+ * @return 成功返回两个因子，否则为空。
+ */
+Memory::Vector<Ptr> splitQuadratic(UnivariatePoly *polynomial) {
+    Memory::Vector<Ptr> factors;
+    if (polynomial->degree() != 2) return factors;
+    Ptr a = polynomial->coefficient(2);
+    Ptr b = polynomial->coefficient(1);
+    Ptr c = polynomial->coefficient(0);
+
+    // 判别式 b²−4ac。数值判别式要求是非负完全平方；
+    // 符号判别式（如 x^2−y^2 里的 4y²）则尝试识别成 `(表达式)²`。
+    Ptr discriminant = simplify(makeAdd(makePow(b, integer(2)),
+                                        makeNegate(makeMul(makeNumber(BigInt(4), BigInt(1)),
+                                                           makeMul(a, c)))));
+    if (!discriminant) return factors;
+
+    Ptr root;          // 判别式的平方根（有理数或符号表达式）
+    bool perfectSquare = false;
+
+    BigInt numerator(0), denominator(1);
+    if (rationalOf(discriminant, &numerator, &denominator)) {
+        if (numerator.isNegative()) return factors;
+        if (!numerator.isPerfectSquare() || !denominator.isPerfectSquare()) return factors;
+        const BigInt rootNumerator = numerator.isqrt();
+        const BigInt rootDenominator = denominator.isqrt();
+        // 判别式为 0：二次式本身是完全平方 (x − r)²，
+        // 两个重根要各出一个因子，否则会丢掉平方（x^2+2xy+y^2 拆成 x+y）。
+        perfectSquare = rootNumerator.isZero();
+        root = makeNumber(rootNumerator, rootDenominator);
+    } else {
+        // 符号判别式：找形如 `k²·(...)²` 或 `±(...)²` 的平方根
+        Ptr squared = sqrtOfSymbolicSquare(discriminant);
+        if (!squared) return factors;
+        root = squared;
+        perfectSquare = root->isZero();
+    }
+    Ptr twiceA = makeNumber(BigInt(2), BigInt(1));
+    twiceA = makeMul(twiceA, a);
+
+    Ptr rootOne = simplify(makeDivide(makeAdd(makeNegate(b), root), twiceA));
+    Ptr rootTwo = simplify(makeDivide(makeAdd(makeNegate(b), makeNegate(root)), twiceA));
+    if (!rootOne || !rootTwo) return factors;
+
+    // 注意不能因为根含符号分母就放弃：`x²y²−1` 按 x 读时根是 ±1/y，
+    // 而 `a·(x − 1/y) = y²x − y = y(xy − 1)` 通分后就变成整系数了。
+    // 是否有残留分式交给组装阶段判定。
+
+    Ptr variable(Node::makeSymbolById(polynomial->variable));
+    // 根含分母 2a，直接写成 `(x − root)` 会带出分式。
+    // 这里统一用 `a·(x − root₁)` 与 `(x − root₂)`，再分别通分成整系数，
+    // 分母并入数值因子——这样 4x²−9y² 得到 4·(x−3/2·y)(x+3/2·y) → (2x−3y)(2x+3y)。
+    auto makeLinear = [&](const Ptr &rootValue) {
+        return makeAdd(variable.share(), makeNegate(rootValue));
+    };
+    Ptr first = simplify(makeMul(a, makeLinear(rootOne)));
+    Ptr second = perfectSquare ? makeLinear(rootOne) : makeLinear(rootTwo);
+    if (!first) return factors;
+    if (!second) second = makeLinear(rootTwo);
+
+    // 把因子整理成整系数形式：逐项取出有理系数，求出所有分母的最小公倍数，
+    // 分子留下做新因子，分母并入总的数值系数。
+    // （toQuotient 只在整体是单个分式时有效，逐项近似分式它看不出来。）
+    auto integralize = [](const Ptr &factor, Ptr *numerator, Ptr *denominator) {
+        Ptr value = expand(factor);
+        if (!value) value = factor;
+
+        // 拆成项：Add 逐项，否则单项
+        Memory::Vector<Ptr> terms;
+        if (value->kind() == NodeKind::Add) {
+            for (NodePtr child : value->operands()) terms.push_back(Ptr::borrow(child));
+        } else {
+            terms.push_back(value);
+        }
+
+        // 每项拆成「系数 × 基」，求系数分母的最小公倍数
+        BigInt lcm(1);
+        Memory::Vector<Ptr> coefficients;
+        Memory::Vector<Ptr> bodies;
+        bool allRational = true;
+        for (const Ptr &term : terms) {
+            Ptr coefficient = integer(1);
+            Ptr body = term;
+            if (term->kind() == NodeKind::Mul) {
+                Ptr rest = integer(1);
+                for (NodePtr child : term->operands()) {
+                    Ptr piece = Ptr::borrow(child);
+                    if (piece->isNumber()) {
+                        Ptr merged = makeMul(coefficient, piece);
+                        if (merged) coefficient = merged;
+                    } else {
+                        Ptr merged = makeMul(rest, piece);
+                        if (merged) rest = merged;
+                    }
+                }
+                body = rest;
+            } else if (term->isNumber()) {
+                coefficient = term;
+                body = integer(1);
+            }
+            BigInt numeratorValue(0), denominatorValue(1);
+            if (!rationalOf(coefficient, &numeratorValue, &denominatorValue)) {
+                allRational = false;
+                break;
+            }
+            lcm = lcm / BigInt::gcd(lcm, denominatorValue) * denominatorValue;
+            coefficients.push_back(coefficient);
+            bodies.push_back(body);
+        }
+        if (!allRational) {
+            *numerator = value;
+            *denominator = integer(1);
+            return;
+        }
+
+        Ptr scaled = integer(0);
+        for (std::size_t index = 0; index < terms.size(); ++index) {
+            BigInt numeratorValue(0), denominatorValue(1);
+            if (!rationalOf(coefficients[index], &numeratorValue, &denominatorValue)) {
+                *numerator = value;
+                *denominator = integer(1);
+                return;
+            }
+            Ptr newCoefficient = makeNumber(numeratorValue * (lcm / denominatorValue), BigInt(1));
+            Ptr term = bodies[index]->isOne() ? newCoefficient : makeMul(newCoefficient, bodies[index]);
+            Ptr sum = makeAdd(scaled, term);
+            if (!sum) {
+                *numerator = value;
+                *denominator = integer(1);
+                return;
+            }
+            scaled = sum;
+        }
+        *numerator = simplify(scaled);
+        *denominator = integer(lcm.fitsLongLong() ? lcm.toLongLong() : 1);
+    };
+
+    Ptr topOne, bottomOne, topTwo, bottomTwo;
+    integralize(first, &topOne, &bottomOne);
+    integralize(second, &topTwo, &bottomTwo);
+
+    Ptr denominators = makeMul(bottomOne, bottomTwo);
+    Ptr coefficient = simplify(makeDivide(integer(1), denominators));
+
+    if (coefficient && !coefficient->isOne()) factors.push_back(coefficient);
+    factors.push_back(topOne);
+    factors.push_back(topTwo);
+
+    // 分解成功，多项式按定义已经全部拆完
+    polynomial->coefficients.clear();
+    return factors;
+}
+
+/**
+ * @brief 把首一四次式拆成两个首一二次因子。
+ *
+ * 对 `x^4 + A·x^3 + B·x^2 + C·x + D`，若存在 `(x^2+p·x+q)(x^2+s·x+r)`，
+ * 比较系数得：
+ *   q + r + p·s = B，p·r + q·s = C，p + s = A，q·r = D。
+ * 这里只处理最常见的对称情形 `s = -p`（此时 A = 0，即缺少三次项），
+ * 于是 `q + r = B + p²`、`p·(r - q) = C`、`q·r = D`。
+ * 对 p = ±1, ±2, … 逐个试（p 必须整除 C 或 C = 0 才有解），能覆盖
+ * `x^4+x^2+1`、`x^4+4`（Sophie Germain）、`x^4+4x^2+4` 一类。
+ *
+ * @return 成功返回两个因子，否则为空。
+ */
+Memory::Vector<Ptr> splitQuartic(UnivariatePoly *polynomial) {
+    Memory::Vector<Ptr> factors;
+    if (polynomial->degree() != 4) return factors;
+
+    // 只处理首一且无三次项的情况
+    Ptr leading = polynomial->coefficient(4);
+    if (!isInt(leading, 1)) return factors;
+    if (!polynomial->coefficient(3)->isZero()) return factors;
+
+    Ptr a2 = polynomial->coefficient(2);
+    Ptr a1 = polynomial->coefficient(1);
+    Ptr a0 = polynomial->coefficient(0);
+
+    Ptr variable(Node::makeSymbolById(polynomial->variable));
+
+    // p 取整数试探：结果里会出 p²、p，因此整数 p 覆盖了绝大多数可分解情形
+    for (long long pValue = 1; pValue <= 64; ++pValue) {
+        for (int sign : {1, -1}) {
+            Ptr p = integer(sign * pValue);
+            Ptr pSquared = simplify(makePow(p, integer(2)));
+
+            // q + r = B + p²，q·r = D，配合 p·(r − q) = C
+            // r − q 必须等于 C/p（p ≠ 0 时可直接算出）
+            Ptr difference = simplify(makeDivide(a1, p));
+            Ptr sum = simplify(makeAdd(a2, pSquared));
+
+            // q = (sum − difference)/2，r = (sum + difference)/2
+            Ptr half = makeNumber(BigInt(1), BigInt(2));
+            Ptr q = simplify(makeMul(half, makeAdd(sum, makeNegate(difference))));
+            Ptr r = simplify(makeMul(half, makeAdd(sum, difference)));
+            if (!q || !r) continue;
+
+            // 校验 q·r = D，避免浮点式误判
+            Ptr product = simplify(makeMul(q, r));
+            Ptr residual = product ? simplify(makeAdd(product, makeNegate(a0))) : Ptr();
+            if (!residual || !residual->isZero()) continue;
+
+            Ptr first = makeAdd(makeAdd(makePow(variable.share(), integer(2)),
+                                        makeMul(p, variable.share())),
+                                q);
+            Ptr second = makeAdd(makeAdd(makePow(variable.share(), integer(2)),
+                                         makeMul(makeNegate(p), variable.share())),
+                                 r);
+            factors.push_back(simplify(first));
+            factors.push_back(simplify(second));
+            polynomial->coefficients.clear();
+            return factors;
+        }
+    }
+    return factors;
+}
+
 } // namespace
 
 /* ---------------------------------------------------- UnivariatePoly */
@@ -588,11 +948,284 @@ Ptr polyResultant(const NodePtr &left, const NodePtr &right, std::uint32_t varia
 
 /* ------------------------------------------------------------ 因式分解 */
 
+/**
+ * @brief 把表达式整理成 `系数 × 因子连乘` 的形式，因子按文本去重合并成幂。
+ *
+ * 多元分解会在不同变量上分别尝试，得到的结果经常是同一份因子的不同排列，
+ * 这里统一展开、按文本排序、相同因子并成幂次，保证输出稳定且紧凑。
+ */
+Ptr assembleFactors(const Memory::Vector<Ptr> &input) {
+    if (input.empty()) return Ptr();
+
+    // 摊平嵌套乘积，按文本归类计数
+    Memory::Vector<Ptr> flat;
+    std::function<void(const Ptr &)> push = [&](const Ptr &node) {
+        if (!node) return;
+        if (node->kind() == NodeKind::Mul) {
+            for (NodePtr inner : node->operands()) push(Ptr::borrow(inner));
+            return;
+        }
+        flat.push_back(node);
+    };
+    for (const Ptr &item : input) push(item);
+    if (flat.empty()) return Ptr();
+
+    PrintOptions options;
+    options.useUnicode = false;
+
+    Ptr coefficient = integer(1);
+    Memory::Vector<std::pair<std::string, std::pair<Ptr, long long>>> groups;
+    for (const Ptr &item : flat) {
+        if (!item) continue;
+        // 纯数值因子并入总系数
+        if (item->isNumber()) {
+            Ptr merged = makeMul(coefficient, item);
+            if (merged) coefficient = merged;
+            continue;
+        }
+        const std::string key = toText(item.get(), options);
+        bool found = false;
+        for (auto &group : groups) {
+            if (group.first == key) {
+                group.second.second += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) groups.push_back({key, {item.share(), 1}});
+    }
+
+    // 按文本排序，保证同一表达式每次输出一致
+    std::sort(groups.begin(), groups.end(),
+              [](const auto &left, const auto &right) { return left.first < right.first; });
+
+    // 把各因子里的数值公因子提到总系数上，形式更干净：
+    // `1/2·(4x−6y)(2x+3y)` → `2·(2x−3y)(2x+3y)`。
+    // 这里不要求因子是单变量的——直接对展开式逐项的数值系数求 gcd，
+    // 多变量因子（如 4x−6y）同样适用。
+    for (auto &group : groups) {
+        Ptr factorValue = group.second.first;
+        Ptr expandedFactor = expand(factorValue);
+        if (!expandedFactor) continue;
+
+        Memory::Vector<Ptr> terms;
+        if (expandedFactor->kind() == NodeKind::Add) {
+            for (NodePtr child : expandedFactor->operands()) terms.push_back(Ptr::borrow(child));
+        } else {
+            terms.push_back(expandedFactor);
+        }
+
+        // 每项取出数值系数，求 gcd；遇到非有理系数就跳过整个因子
+        BigInt common(0);
+        Memory::Vector<std::pair<Ptr, Ptr>> pieces; // (系数, 基)
+        bool rational = true;
+        for (const Ptr &term : terms) {
+            Ptr coefficient = integer(1);
+            Ptr body = term;
+            if (term->kind() == NodeKind::Mul) {
+                Ptr rest = integer(1);
+                for (NodePtr child : term->operands()) {
+                    Ptr piece = Ptr::borrow(child);
+                    if (piece->isNumber()) {
+                        Ptr merged = makeMul(coefficient, piece);
+                        if (merged) coefficient = merged;
+                    } else {
+                        Ptr merged = makeMul(rest, piece);
+                        if (merged) rest = merged;
+                    }
+                }
+                body = rest;
+            } else if (term->isNumber()) {
+                coefficient = term;
+                body = integer(1);
+            }
+            BigInt numeratorValue(0), denominatorValue(1);
+            if (!rationalOf(coefficient, &numeratorValue, &denominatorValue)) {
+                rational = false;
+                break;
+            }
+            common = common.isZero() ? numeratorValue.abs() : BigInt::gcd(common, numeratorValue.abs());
+            pieces.push_back({coefficient, body});
+        }
+        if (!rational || common.isZero() || common.isOne()) continue;
+
+        // 用 gcd 重新构造因子：系数除以 common
+        Ptr scaled = integer(0);
+        bool ok = true;
+        for (const auto &piece : pieces) {
+            Ptr reduced = simplify(makeDivide(piece.first, integer(common.fitsLongLong() ? common.toLongLong() : 1)));
+            if (!reduced) {
+                ok = false;
+                break;
+            }
+            Ptr term = piece.second->isOne() ? reduced : makeMul(reduced, piece.second);
+            Ptr sum = makeAdd(scaled, term);
+            if (!sum) {
+                ok = false;
+                break;
+            }
+            scaled = sum;
+        }
+        if (!ok) continue;
+
+        Ptr divided = simplify(scaled);
+        if (!divided) continue;
+        group.first = toText(divided.get(), options);
+        group.second.first = divided;
+        Ptr merged = makeMul(coefficient, integer(common.fitsLongLong() ? common.toLongLong() : 1));
+        if (merged) coefficient = merged;
+    }
+
+    // 重新去重（提取公因子后可能整体重复）
+    {
+        Memory::Vector<std::pair<std::string, std::pair<Ptr, long long>>> dedup;
+        for (const auto &group : groups) {
+            bool found = false;
+            for (auto &other : dedup) {
+                if (other.first == group.first) {
+                    other.second.second += group.second.second;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) dedup.push_back(group);
+        }
+        groups = dedup;
+        std::sort(groups.begin(), groups.end(),
+                  [](const auto &left, const auto &right) { return left.first < right.first; });
+    }
+
+    // 必须用 Ptr 持有每个操作数直到 makeMulMany 调用结束——
+    // 只存裸 NodePtr 的话，生成它们的临时 Ptr 会在语句结束时析构，
+    // 引用计数归零后节点被回收，留下的就是悬垂指针。
+    Memory::Vector<Ptr> holders;
+    if (!isInt(coefficient, 1)) holders.push_back(coefficient);
+    for (const auto &group : groups) {
+        if (group.second.second <= 1) {
+            holders.push_back(group.second.first);
+        } else {
+            Ptr power = makePow(group.second.first, integer(group.second.second));
+            if (power) holders.push_back(power);
+        }
+    }
+    if (holders.empty()) return integer(1);
+    if (holders.size() == 1) return holders.front().share();
+
+    Memory::Vector<NodePtr> operands;
+    operands.reserve(holders.size());
+    for (const Ptr &holder : holders) operands.push_back(holder.get());
+    return makeMulMany(operands);
+}
+
+/**
+ * @brief 多元因式分解：逐个变量当作一元多项式尝试。
+ *
+ * 做法是对每个自由符号 `v`，把表达式视作 `v` 的一元多项式（其余符号作为系数），
+ * 走一遍一元分解；只要某个 `v` 上能拆开，就把结果当作新的候选，继续对因子递归。
+ * 这条策略覆盖了教科书层面的多元分解：
+ *
+ *   x^2 - y^2          （按 x 看，常数项 -y^2，判别式 4y^2 是平方）
+ *   x^2 + 2xy + y^2    （按 x 看，判别式 0）
+ *   x^2*y^2 - 1        （按 x 看，是 x^2 减常数）
+ *   x*y + x + y + 1    （按 x 看，一次式，系数含 y）
+ *
+ * 子因子数明显多于输入时放弃，避免组合爆炸。
+ */
+Ptr factorMultivariate(const Ptr &expression, const Memory::Vector<std::uint32_t> &symbols) {
+    PrintOptions options;
+    options.useUnicode = false;
+    const std::string originalText = toText(expression.get(), options);
+
+    Ptr best; // 当前找到的最优结果
+    for (std::uint32_t variable : symbols) {
+        UnivariatePoly polynomial;
+        if (!toPolynomial(expression.get(), variable, &polynomial)) continue;
+        if (polynomial.degree() < 1) continue;
+
+        // 复用一元路径：把系数当作不透明的表达式，走同一套结构规则。
+        // 这里只做"提取数值公因子 + 线性因子 + 二次拆分"这几条，
+        // 不对符号系数做有理根搜索（那是无意义的）。
+        Memory::Vector<Ptr> pieces;
+
+        if (polynomial.degree() == 2) {
+            UnivariatePoly copy = polynomial;
+            const auto quadratics = splitQuadratic(&copy);
+            for (const Ptr &piece : quadratics) pieces.push_back(piece);
+        } else if (polynomial.degree() == 4) {
+            UnivariatePoly copy = polynomial;
+            const auto quartics = splitQuartic(&copy);
+            for (const Ptr &piece : quartics) pieces.push_back(piece);
+            if (!quartics.empty()) polynomial = copy;
+        }
+
+        if (pieces.empty()) continue;
+
+        Ptr candidate = assembleFactors(pieces);
+        if (!candidate) continue;
+        const std::string candidateText = toText(candidate.get(), options);
+        if (candidateText == originalText) continue;
+        // 注意不要用"文本更短"来过滤：`(x - y)*(x + y)` 比 `x^2 - y^2` 长，
+        // 但它才是分解结果。只要拆开了就接受。
+
+        // 对每个因子继续递归，把还能拆的部分拆干净
+        Memory::Vector<Ptr> refined;
+        if (candidate->kind() == NodeKind::Mul) {
+            for (NodePtr child : candidate->operands()) {
+                Ptr one = Ptr::borrow(child);
+                const auto childSymbols = freeSymbols(one.get());
+                if (childSymbols.size() <= 1) {
+                    Ptr deeper = factor(one);
+                    refined.push_back(deeper ? deeper : one);
+                } else {
+                    refined.push_back(one);
+                }
+            }
+        } else {
+            refined.push_back(candidate);
+        }
+
+        Ptr result = assembleFactors(refined);
+        if (!result) continue;
+        // 含负指数的候选直接排除：`(x + 1/y)(x*y^2 − y)` 展开就是原式，
+        // 属于"表面上拆开、实际只是把分母挪来挪去"，不是真正的分解。
+        PrintOptions local;
+        local.useUnicode = false;
+        auto hasNegativePower = [](const Ptr &node) {
+            std::function<bool(const Ptr &)> walk = [&](const Ptr &current) -> bool {
+                if (!current) return false;
+                if (current->kind() == NodeKind::Pow) {
+                    Ptr exponent = Ptr::borrow(current->operand(1));
+                    if (exponent->isNumber() && exponent->isNegative()) return true;
+                }
+                for (std::size_t index = 0; index < current->size(); ++index) {
+                    if (walk(Ptr::borrow(current->operand(index)))) return true;
+                }
+                return false;
+            };
+            return walk(node);
+        };
+        if (hasNegativePower(result)) continue;
+
+        // 剩下比因子数：多的更好（拆得更彻底）。
+        const std::size_t candidateCount = result->kind() == NodeKind::Mul ? result->size() : 1;
+        const std::size_t bestCount = best && best->kind() == NodeKind::Mul ? best->size() : 1;
+        if (!best || candidateCount > bestCount) best = result;
+    }
+    return best;
+}
+
 Ptr factor(const Ptr &expression) {
     Ptr simplified = simplify(expression);
     if (!simplified) return Ptr();
 
     const auto symbols = freeSymbols(simplified.get());
+    if (symbols.size() > 1) {
+        // 多元路径要把表达式摊成标准和式，才能按变量读系数
+        Ptr expanded = expand(simplified);
+        Ptr factored = factorMultivariate(expanded ? expanded : simplified, symbols);
+        // 拆不开（例如 x^4+y^4 在有理域上不可约）就原样返回，不要当失败
+        return factored ? factored : (expanded ? expanded : simplified);
+    }
     if (symbols.size() != 1) return simplified;
     const std::uint32_t variable = symbols.front();
 
@@ -627,10 +1260,30 @@ Ptr factor(const Ptr &expression) {
     if (!isInt(numeric, 1)) factors.push_back(numeric);
 
     // 2. 一次因子（有理根定理 + 综合除法）
-    const auto linearFactors = extractLinearFactors(&polynomial);
-    for (const Ptr &linear : linearFactors) factors.push_back(linear);
+    if (polynomial.degree() >= 1) {
+        const auto linearFactors = extractLinearFactors(&polynomial);
+        for (const Ptr &linear : linearFactors) factors.push_back(linear);
+    }
 
-    // 4. 剩余部分
+    // 3. 剩余部分仍是二次：判别式为完全平方时可直接拆成两个一次因子
+    if (polynomial.degree() == 2) {
+        const auto quadratics = splitQuadratic(&polynomial);
+        for (const Ptr &piece : quadratics) factors.push_back(piece);
+    }
+
+    // 4. 四次式拆两个首一二次因子：x^4+x^2+1 → (x^2+x+1)(x^2-x+1)
+    if (polynomial.degree() == 4) {
+        const auto quarticFactors = splitQuartic(&polynomial);
+        for (const Ptr &piece : quarticFactors) factors.push_back(piece);
+    }
+
+    // 5. 偶次代换：x^8-1 → (x^2+1)(x^4+1)，x^6-1 之类也走这条
+    if (polynomial.degree() >= 4) {
+        const auto evenFactors = factorByEvenSubstitution(&polynomial);
+        for (const Ptr &piece : evenFactors) factors.push_back(piece);
+    }
+
+    // 6. 剩余部分
     if (polynomial.degree() >= 1) factors.push_back(fromPolynomial(polynomial));
 
     if (factors.empty()) return simplified;

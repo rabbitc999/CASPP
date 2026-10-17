@@ -1,5 +1,6 @@
 // 多项式代数自检：展开、带余除法、GCD、Resultant、因式分解、通分。
 #include "cas/allocator.h"
+#include "cas/engine.h"
 #include "cas/detail/node.h"
 #include "cas/detail/polynomial.h"
 #include "cas/detail/simplify.h"
@@ -159,6 +160,88 @@ void testFactor() {
     std::printf("  factor(6x^2+9x) = %s\n", describe(factored4.get()).c_str());
 }
 
+/**
+ * @brief 高次分解的回归用例。
+ *
+ * 统一走 `Engine::factor`（文本输出）以便直接比对结果字符串，
+ * 覆盖平方差、完全平方、Sophie Germain、偶次代换四条规则。
+ */
+void testHighDegreeFactor() {
+    Cas::Engine engine;
+    auto expectFactor = [&](const char *input, const char *expected) {
+        const Cas::Result result = engine.factor(input);
+        if (!result.ok) {
+            std::printf("FAIL %-28s ← 错误：%s\n", input, result.message.c_str());
+            ++failures;
+            return;
+        }
+        if (result.text != expected) {
+            std::printf("FAIL %-28s ← 得到 %s，期望 %s\n", input, result.text.c_str(), expected);
+            ++failures;
+            return;
+        }
+        std::printf("  %-28s = %s\n", input, result.text.c_str());
+    };
+
+    // 平方差族
+    expectFactor("x^4-1", "(x - 1)*(x + 1)*(x^2 + 1)");
+    expectFactor("x^8-1", "(x - 1)*(x + 1)*(x^2 + 1)*(x^4 + 1)");
+
+    // 完全平方（偶次代换）
+    expectFactor("x^4+2*x^2+1", "(x^2 + 1)^2");
+    expectFactor("x^4+6*x^2+9", "(x^2 + 3)^2");
+
+    // 二次因子拆分：判别式非平方但在有理域上可拆
+    expectFactor("x^4+x^2+1", "(x^2 + x + 1)*(x^2 - x + 1)");
+    expectFactor("x^6-1", "(x - 1)*(x + 1)*(x^2 + x + 1)*(x^2 - x + 1)");
+
+    // Sophie Germain：x^4+4 = (x^2-2x+2)(x^2+2x+2)
+    expectFactor("x^4+4", "(x^2 - 2*x + 2)*(x^2 + 2*x + 2)");
+
+    // 不可约：应原样返回，不能被误拆
+    expectFactor("x^4+1", "x^4 + 1");
+    expectFactor("x^2+1", "x^2 + 1");
+}
+
+/**
+ * @brief 多元分解的回归用例。
+ *
+ * 策略是对每个变量当作一元多项式各试一次，再取因子数最多的结果，
+ * 因此这里同时校验"能拆"与"不能拆时原样返回"两种情况。
+ */
+void testMultivariateFactor() {
+    Cas::Engine engine;
+    auto expectFactor = [&](const char *input, const char *expected) {
+        const Cas::Result result = engine.factor(input);
+        if (!result.ok) {
+            std::printf("FAIL %-28s ← 错误：%s\n", input, result.message.c_str());
+            ++failures;
+            return;
+        }
+        if (result.text != expected) {
+            std::printf("FAIL %-28s ← 得到 %s，期望 %s\n", input, result.text.c_str(), expected);
+            ++failures;
+            return;
+        }
+        std::printf("  %-28s = %s\n", input, result.text.c_str());
+    };
+
+    // 平方差（按 x 或 y 看，判别式 4y² 是符号完全平方）
+    expectFactor("x^2-y^2", "(x + y)*(x - y)");
+    expectFactor("4*x^2-9*y^2", "(-3*y + 2*x)*(2*x + 3*y)");
+
+    // 完全平方
+    expectFactor("x^2+2*x*y+y^2", "(x + y)^2");
+
+    // 十字相乘
+    expectFactor("x^2+3*x*y+2*y^2", "(x + y)*(x + 2*y)");
+    expectFactor("2*x^2+5*x*y+2*y^2", "(x + 2*y)*(y + 2*x)");
+
+    // 有理域上不可约：必须原样返回，不能报错也不能硬拆
+    expectFactor("x^4+y^4", "x^4 + y^4");
+    expectFactor("x^2+y^2", "x^2 + y^2");
+}
+
 void testTogether() {
     Ptr x = sym("x");
     // 1/x + 1/(x+1) = (2x+1)/(x(x+1))
@@ -180,6 +263,8 @@ int main() {
     testGcd();                 std::printf("gcd ok\n");
     testResultant();           std::printf("resultant ok\n");
     testFactor();              std::printf("factor ok\n");
+    testHighDegreeFactor();    std::printf("high-degree factor ok\n");
+    testMultivariateFactor();  std::printf("multivariate factor ok\n");
     testTogether();            std::printf("together ok\n");
 
     if (failures == 0) {
