@@ -88,6 +88,16 @@ private:
 
         const char c = m_text[m_position];
 
+        // 区间运算符 `..`（sum(i^2, i=1..n) 的上下限分隔）要先于数字识别，
+        // 否则 `.` 会被当成小数点送进 readNumber，遇到 `..` 又没有字符可读，
+        // 结果既不产出 token 也不推进位置——死循环。
+        if (c == '.' && m_position + 1 < m_text.size() && m_text[m_position + 1] == '.') {
+            m_token.kind = TokenKind::Operator;
+            m_token.text = "..";
+            m_position += 2;
+            m_token.end = m_position;
+            return;
+        }
         if (std::isdigit(static_cast<unsigned char>(c)) || c == '.') {
             readNumber();
             return;
@@ -133,6 +143,13 @@ private:
             m_token.text = ":";
             m_position += 1;
             break;
+        case '.':
+            // 走到这里说明是孤立的 `.`（`..` 已在函数开头处理）
+            m_token.kind = TokenKind::Operator;
+            m_token.text = ".";
+            m_position += 1;
+            fail("无法识别的字符 '.'");
+            break;
         default:
             m_token.kind = TokenKind::Operator;
             m_token.text = std::string(1, c);
@@ -149,7 +166,13 @@ private:
         while (m_position < m_text.size()) {
             const char c = m_text[m_position];
             if (std::isdigit(static_cast<unsigned char>(c))) { ++m_position; continue; }
-            if (c == '.' && !seenDot && !seenExponent) { seenDot = true; ++m_position; continue; }
+            // `..` 是区间运算符（`1..n`），不是小数点，禁止在这里吞掉它
+            if (c == '.' && !seenDot && !seenExponent) {
+                if (m_position + 1 < m_text.size() && m_text[m_position + 1] == '.') break;
+                seenDot = true;
+                ++m_position;
+                continue;
+            }
             if ((c == 'e' || c == 'E') && !seenExponent &&
                 m_position + 1 < m_text.size() &&
                 (std::isdigit(static_cast<unsigned char>(m_text[m_position + 1])) ||
@@ -284,6 +307,14 @@ private:
             advance();
             Ptr right = parseAdditive();
             if (!right) return Ptr();
+            // 区间写法 `i=1..n`（求和/敛散性判别的上下限）→ range(i, 1, n)
+            if (isOperator("..")) {
+                advance();
+                Ptr upper = parseAdditive();
+                if (!upper) return Ptr();
+                Memory::Vector<NodePtr> arguments{left.get(), right.get(), upper.get()};
+                return Ptr(Node::makeFunction("range", arguments));
+            }
             // 等式表示为 equal(left, right)，供 solve 直接使用
             Memory::Vector<NodePtr> arguments{left.get(), right.get()};
             return Ptr(Node::makeFunction("equal", arguments));
@@ -360,8 +391,16 @@ private:
         for (;;) {
             if (isOperator("!")) {
                 advance();
+                // `!!` 是双阶乘（一次消费两个 `!`），不能当成两次阶乘
+                const bool doubleFactorial = isOperator("!");
+                if (doubleFactorial) advance();
                 // 阶乘只对非负整数求值
                 long long number = 0;
+                if (doubleFactorial) {
+                    Memory::Vector<NodePtr> arguments{value.get()};
+                    value = Ptr(Node::makeFunction("factorial2", arguments));
+                    continue;
+                }
                 if (value->isSmallInteger(&number) && number >= 0 && number <= 20) {
                     long long product = 1;
                     for (long long k = 2; k <= number; ++k) product *= k;
@@ -373,9 +412,27 @@ private:
                 continue;
             }
             if (isOperator("'")) {
-                advance();
-                Memory::Vector<NodePtr> arguments{value.get()};
-                value = Ptr(Node::makeFunction("diff", arguments));
+                // 连续撇号 `y''` 表示二阶导，整段一次消费
+                int order = 0;
+                while (isOperator("'")) {
+                    advance();
+                    ++order;
+                }
+                // 简单符号的撇号按 ODE 记法解释：y' ⇒ Derivative(y, x)
+                // 其它形态（如 (x^2+1)'）沿用 diff(expr) 的写法
+                if (value->kind() == NodeKind::Symbol && order <= 3) {
+                    const std::string name = value->name() ? value->name() : std::string();
+                    const std::uint32_t variableId = internSymbol("x");
+                    Ptr variablePtr = Ptr(Node::makeSymbolById(variableId));
+                    Ptr orderPtr = integer(order);
+                    Memory::Vector<NodePtr> arguments{value.get(), variablePtr.get(), orderPtr.get()};
+                    value = Ptr(Node::makeFunction("Derivative", arguments));
+                    continue;
+                }
+                for (int k = 0; k < order; ++k) {
+                    Memory::Vector<NodePtr> arguments{value.get()};
+                    value = Ptr(Node::makeFunction("diff", arguments));
+                }
                 continue;
             }
             break;
@@ -459,11 +516,11 @@ private:
         if (name == "pi" || name == "PI" || name == "Pi") return Ptr(Node::makeConstant(ConstantId::Pi));
         if (name == "e" || name == "E") return Ptr(Node::makeConstant(ConstantId::E));
         if (name == "oo" || name == "inf" || name == "infinity") return Ptr(Node::makeConstant(ConstantId::Infinity));
-        if (name == "gamma" || name == "EulerGamma") return Ptr(Node::makeConstant(ConstantId::EulerGamma));
-        if (name == "i" || name == "I") {
-            // 复数单位暂不作为一等公民，保留为符号以免误算实数结果
-            return Ptr(Node::makeSymbol("I"));
-        }
+        // `gamma` 现在是 Γ 函数，欧拉常数改由 EulerGamma / eulergamma 表示
+        if (name == "EulerGamma" || name == "eulergamma") return Ptr(Node::makeConstant(ConstantId::EulerGamma));
+        // 复数单位暂不作为一等公民：只有大写 `I` 保留为符号 `I`，
+        // 小写 `i` 是普通变量（求和下标等场景大量使用，不能被偷换）。
+        if (name == "I") return Ptr(Node::makeSymbol("I"));
 
         // 函数调用
         if (m_token.kind == TokenKind::LeftParen && isFunctionName(name)) {
@@ -516,7 +573,19 @@ private:
             "simplify", "simp", "expand", "factor", "together", "trigsimp", "trigs",
             "latex", "diff", "differentiate", "derivative", "integrate", "int", "integral",
             "limit", "lim", "taylor", "series", "solve", "groebner", "gb", "resultant", "res",
-            "list", "equal",
+            "list", "equal", "range",
+            // 级数与特殊函数
+            "sum", "summation", "converge", "converges", "bernoulli", "guess",
+            "specialsimplify", "specialsimp", "spsimp",
+            "gamma", "factorial", "factorial2", "doublefactorial", "beta", "binomial",
+            "harmonic", "erf", "erfc", "erfi", "Ei", "li",
+            "besselj", "bessely", "besseli", "besselk",
+            // 线性代数
+            "det", "determinant", "inv", "inverse", "invert", "transpose", "trans",
+            "trace", "tr", "matmul", "dot", "rank", "rref", "charpoly",
+            "eigenvals", "eigenvalues", "identity", "eye",
+            // 常微分方程
+            "dsolve", "ode", "Derivative", "odeclassify",
         };
         for (const char *candidate : kNames) {
             if (name == candidate) return true;
@@ -535,7 +604,7 @@ private:
 
 bool isReservedConstantName(const std::string &name) {
     return name == "pi" || name == "PI" || name == "Pi" || name == "e" || name == "E" || name == "oo" ||
-           name == "inf" || name == "infinity" || name == "gamma" || name == "EulerGamma";
+           name == "inf" || name == "infinity" || name == "EulerGamma" || name == "eulergamma";
 }
 
 ParseResult parseExpression(const std::string &text) {

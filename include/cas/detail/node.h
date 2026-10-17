@@ -71,6 +71,9 @@ public:
     /** @brief 创建常数节点。 */
     static NodePtr makeConstant(ConstantId id);
 
+    /** @brief 当前强引用数（调试与测试用）。 */
+    std::uint32_t refCount() const { return m_refs; }
+
     /** @brief 增加引用计数。 */
     static void retain(NodePtr node);
     /** @brief 减少引用计数，归零时销毁。 */

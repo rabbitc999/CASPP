@@ -19,6 +19,18 @@ namespace {
 /** @brief 版本信息。 */
 const char *const kVersion = "1.0.0";
 
+/**
+ * @brief 去掉结果文本里的内部标记。
+ *
+ * 矩阵结果在 `Result::text` 开头带一个 `\x1F` 标记，供嵌套调用（如 `det(inv(A))`）
+ * 识别"上一步的结果是个矩阵"；打印给用户之前要剥掉。
+ */
+std::string displayText(const std::string &text) {
+    std::size_t begin = 0;
+    while (begin < text.size() && text[begin] == '\x1F') ++begin;
+    return text.substr(begin);
+}
+
 /** @brief 打印横幅。 */
 void printBanner() {
     std::printf("caspp %s —— 代数符号计算器（C++17）\n", kVersion);
@@ -28,7 +40,7 @@ void printBanner() {
 /** @brief 打印单条结果。 */
 void printResult(const Cas::Result &result) {
     if (result.ok) {
-        std::printf("%s\n", result.text.c_str());
+        std::printf("%s\n", displayText(result.text).c_str());
         std::printf("  [LaTeX] %s\n", result.latex.c_str());
     } else {
         std::printf("错误：%s\n", result.message.c_str());
@@ -84,7 +96,7 @@ bool handleCommand(Cas::Engine *engine, const std::string &line) {
         return true;
     }
     if (trimmed == "%") {
-        std::printf("%s\n", engine->lastResult().c_str());
+        std::printf("%s\n", displayText(engine->lastResult()).c_str());
         return true;
     }
 

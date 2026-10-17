@@ -439,6 +439,33 @@ Ptr makePow(Ptr base, Ptr exponent) {
         return Ptr(Node::makePower(base.get(), exponent.get()));
     }
 
+    // e^{log u} = u，以及 e^{c·log u} = u^c（c 为数值）
+    if (base->kind() == NodeKind::Constant && base->constant() == ConstantId::E) {
+        Ptr logarithm = Ptr();
+        Ptr scale = Ptr();
+        if (exponent->kind() == NodeKind::Function && exponent->size() == 1 && exponent->name() &&
+            (std::strcmp(exponent->name(), "log") == 0 || std::strcmp(exponent->name(), "ln") == 0)) {
+            logarithm = exponent;
+            scale = integer(1);
+        } else if (exponent->kind() == NodeKind::Mul && exponent->size() == 2) {
+            Ptr first = Ptr::borrow(exponent->operand(0));
+            Ptr second = Ptr::borrow(exponent->operand(1));
+            Ptr numericPart = first->isNumber() ? first : (second->isNumber() ? second : Ptr());
+            Ptr otherPart = first->isNumber() ? second : first;
+            if (numericPart && otherPart->kind() == NodeKind::Function && otherPart->size() == 1 &&
+                otherPart->name() &&
+                (std::strcmp(otherPart->name(), "log") == 0 || std::strcmp(otherPart->name(), "ln") == 0)) {
+                logarithm = otherPart;
+                scale = numericPart;
+            }
+        }
+        if (logarithm && scale) {
+            Ptr argument = Ptr::borrow(logarithm->operand(0));
+            if (!argument) return Ptr();
+            return makePow(argument, scale);
+        }
+    }
+
     // (x^a)^b → x^(a·b)：整数指数时安全
     if (base->kind() == NodeKind::Pow && exponent->isNumber() && exponent->isInteger()) {
         Ptr innerBase = Ptr::borrow(base->operand(0));

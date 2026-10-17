@@ -1,16 +1,19 @@
 #include "cas/engine.h"
 
 #include "cas/detail/calculus.h"
+#include "cas/detail/matrix.h"
 #include "cas/detail/multivariate.h"
+#include "cas/detail/ode.h"
 #include "cas/detail/parser.h"
 #include "cas/detail/polynomial.h"
 #include "cas/detail/printer.h"
+#include "cas/detail/series.h"
 #include "cas/detail/simplify.h"
+#include "cas/detail/special.h"
 #include "cas/detail/solver.h"
 #include "cas/detail/trigonometry.h"
 
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 
 namespace Cas {
@@ -103,6 +106,146 @@ std::string variableName(const Ptr &argument) {
     if (!argument) return "x";
     if (argument->kind() == NodeKind::Symbol && argument->name()) return argument->name();
     return "x";
+}
+
+/* -------------------------------------------------------------- 矩阵 */
+
+/** @brief 是否为 list(...) 节点。 */
+bool isListNode(const Ptr &node) {
+    return node && node->kind() == NodeKind::Function && node->name() && std::strcmp(node->name(), "list") == 0;
+}
+
+/** @brief 矩阵结果在文本渲染之上附加一个结构化标记，供嵌套调用识别。 */
+const char kMatrixMark = '\x1F';
+
+bool parseMatrixText(const std::string &text, Detail::SymbolicMatrix *out);
+
+/**
+ * @brief 把 `[[1,2],[3,4]]` 或 `list(list(1,2),list(3,4))` 解析成矩阵。
+ *
+ * 也接受扁平列表 `[1,2,3,4]`（此时需要期望的行数才能定形状，这里一律当 1 行）。
+ */
+bool toMatrix(const Ptr &node, Detail::SymbolicMatrix *out) {
+    if (!node) return false;
+    if (!isListNode(node)) {
+        // 上一级命令的渲染结果（带矩阵标记）也能被内层识别
+        if (node->kind() == NodeKind::Symbol && node->name() && *node->name() == kMatrixMark) {
+            return parseMatrixText(node->name(), out);
+        }
+        // 未求值的命令调用（如 det(inv(...))）不是矩阵：必须先把内层算出来
+        if (node->kind() == NodeKind::Function && node->name() &&
+            std::strcmp(node->name(), "list") != 0) {
+            return false;
+        }
+        // 单个标量视为 1×1
+        *out = Detail::SymbolicMatrix(1, 1);
+        out->set(0, 0, node);
+        return true;
+    }
+    if (node->size() == 0) return false;
+
+    // 行形态：每个元素都是 list
+    const bool nested = isListNode(Ptr::borrow(node->operand(0)));
+    if (nested) {
+        const std::size_t rows = node->size();
+        std::size_t columns = 0;
+        for (NodePtr child : node->operands()) {
+            Ptr row(Ptr::borrow(child).share());
+            if (!isListNode(row)) return false;
+            if (columns == 0) columns = row->size();
+            else if (row->size() != columns) return false; // 各行长度必须一致
+        }
+        if (columns == 0) return false;
+        Memory::Vector<NodePtr> raw;
+        raw.reserve(rows * columns);
+        for (NodePtr child : node->operands()) {
+            Ptr row(Ptr::borrow(child).share());
+            for (NodePtr cell : row->operands()) raw.push_back(cell);
+        }
+        Memory::Vector<Ptr> entries;
+        entries.reserve(raw.size());
+        for (NodePtr cell : raw) entries.push_back(Ptr::borrow(cell).share());
+        *out = Detail::SymbolicMatrix::fromRows(rows, columns, entries);
+        return !out->isEmpty();
+    }
+
+    // 扁平列表 → 单行矩阵
+    Memory::Vector<Ptr> entries;
+    entries.reserve(node->size());
+    for (NodePtr cell : node->operands()) entries.push_back(Ptr::borrow(cell).share());
+    *out = Detail::SymbolicMatrix::fromRows(1, entries.size(), entries);
+    return !out->isEmpty();
+}
+
+/** @brief 矩阵渲染成 `[[a, b], [c, d]]`。 */
+std::string renderMatrix(const Detail::SymbolicMatrix &matrix, bool unicode) {
+    std::string text = "[";
+    for (std::size_t row = 0; row < matrix.rows(); ++row) {
+        if (row > 0) text += ", ";
+        text += "[";
+        for (std::size_t column = 0; column < matrix.columns(); ++column) {
+            if (column > 0) text += ", ";
+            const Ptr &entry = matrix.at(row, column);
+            text += entry ? toText(entry.get(), PrintOptions{unicode}) : std::string("0");
+        }
+        text += "]";
+    }
+    text += "]";
+    return text;
+}
+
+/** @brief 矩阵的 LaTeX 形式，用 \begin{pmatrix}。 */
+std::string renderMatrixLatex(const Detail::SymbolicMatrix &matrix) {
+    std::string text = "\\begin{pmatrix}";
+    for (std::size_t row = 0; row < matrix.rows(); ++row) {
+        if (row > 0) text += " \\\\ ";
+        for (std::size_t column = 0; column < matrix.columns(); ++column) {
+            if (column > 0) text += " & ";
+            const Ptr &entry = matrix.at(row, column);
+            text += entry ? toLatex(entry.get(), PrintOptions{}) : std::string("0");
+        }
+    }
+    text += "\\end{pmatrix}";
+    return text;
+}
+
+/** @brief 用矩阵构造一个成功的 Result。 */
+Result makeMatrixResult(const Detail::SymbolicMatrix &matrix, bool unicode) {
+    Result result;
+    result.ok = true;
+    result.text = kMatrixMark + renderMatrix(matrix, unicode);
+    result.latex = renderMatrixLatex(matrix);
+    return result;
+}
+
+/** @brief 判断节点是否为数值零（用于逆矩阵的奇异检测）。 */
+bool isNumericZero(const Ptr &node) {
+    return node && node->isNumber() && node->numerator().isZero();
+}
+
+/**
+ * @brief 去掉文本里所有的矩阵标记。
+ *
+ * 标记 `\x1F` 不是合法字符，解析器见到它会报"非法字符"。把矩阵结果喂给外层命令前
+ * 需要先剥掉它——标记只用于 `evaluate` 层判断结果形态，不参与表达式语法。
+ */
+std::string stripMatrixMark(const std::string &text) {
+    std::string clean;
+    clean.reserve(text.size());
+    for (char ch : text) {
+        if (ch != kMatrixMark) clean.push_back(ch);
+    }
+    return clean;
+}
+
+/** @brief 从渲染文本还原矩阵；可以带矩阵标记，也可以是形如 `[[...]]` 的纯文本。 */
+bool parseMatrixText(const std::string &text, Detail::SymbolicMatrix *out) {
+    if (text.empty()) return false;
+    const std::size_t begin = (text[0] == kMatrixMark) ? 1 : 0;
+    if (text.size() <= begin) return false;
+    const ParseResult parsed = parseExpression(text.substr(begin));
+    if (!parsed.ok) return false;
+    return toMatrix(parsed.expression, out);
 }
 
 } // namespace
@@ -312,6 +455,51 @@ Result Engine::solve(const std::string &equation, const std::string &variable) {
     return result;
 }
 
+Result Engine::dsolve(const std::string &equation, const std::string &unknown,
+                      const std::string &variable) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+
+    const ParseResult parsed = parseExpression(equation);
+    if (!parsed.ok) return makeError(parsed.message, parsed.position);
+
+    Ptr left;
+    Ptr right;
+    if (!splitEquation(parsed.expression, &left, &right)) return makeError("方程形式无法识别");
+
+    // 整理成 F = 0
+    Ptr residual = Detail::simplify(makeAdd(left.share(), makeNegate(right)));
+    if (!residual) return makeError("方程整理失败");
+
+    const std::uint32_t unknownId = symbolOf(unknown);
+    const std::uint32_t variableId = symbolOf(variable);
+
+    std::string method;
+    std::string message;
+    Ptr solution = Detail::solveOde(residual, unknownId, variableId, &method, &message);
+    if (!solution) return makeError(message.empty() ? "无法求解该微分方程" : message);
+
+    const char *unknownName = symbolName(unknownId);
+    const std::string name = unknownName ? unknownName : unknown;
+
+    result.ok = true;
+    // 显式解（线性/二阶常系数）返回的形态是 `solution - y`，把它还原成 `y = solution`
+    if (method.find("线性") != std::string::npos || method.find("二阶") != std::string::npos) {
+        Ptr explicitForm = Detail::simplify(makeAdd(solution, Ptr(Node::makeSymbolById(unknownId))));
+        if (explicitForm) {
+            result.text = name + " = " + toText(explicitForm.get());
+            result.latex = name + " = " + toLatex(explicitForm.get());
+            m_lastResult = toText(explicitForm.get());
+            return result;
+        }
+    }
+
+    // 其余方法给出隐式解：写成 `… = 0`，其中已包含积分常数 C1
+    result.text = "隐式解（" + method + "）：" + toText(solution.get()) + " = 0";
+    result.latex = result.text;
+    return result;
+}
+
 Result Engine::solveSystem(const std::vector<std::string> &equations, const std::vector<std::string> &variables) {
     Result result;
     Timer timer(&result.elapsedMs);
@@ -498,7 +686,145 @@ Result Engine::taylorOfNode(const Detail::Ptr &expression, const Detail::Ptr &po
     return result;
 }
 
+/* ------------------------------------------------------------ 级数 */
+
+namespace {
+
+/**
+ * @brief 把 `i=1..n` 解析出的 range(i, 1, n) 拆成求和上下限。
+ * @return 成功时填充 limits；失败返回 false 并写入 message。
+ */
+bool parseRange(const Detail::Ptr &range, Detail::SumLimits *limits, std::string *message) {
+    if (!range || range->kind() != NodeKind::Function || !range->name()) {
+        *message = "需要区间写法 i=1..n（上限可写 oo 表示无穷），例如 sum(1/i^2, i=1..oo)";
+        return false;
+    }
+    const std::string name = range->name();
+    if (name == "range" && range->size() == 3) {
+        const Ptr variable = Ptr::borrow(range->operand(0));
+        if (variable->kind() != NodeKind::Symbol) {
+            *message = "区间写法应为 变量=下界..上界";
+            return false;
+        }
+        limits->variable = variable->symbolId();
+        limits->lower = Detail::simplify(Ptr::borrow(range->operand(1)));
+        limits->upper = Detail::simplify(Ptr::borrow(range->operand(2)));
+        return true;
+    }
+    if (name == "equal" && range->size() == 2) {
+        *message = "上限缺失：请写成 i=1..n";
+        return false;
+    }
+    *message = "需要区间写法 i=1..n（上限可写 oo 表示无穷）";
+    return false;
+}
+
+} // namespace
+
+Result Engine::sumCommand(const Detail::Ptr &term, const Detail::Ptr &range, const Detail::Ptr &variable) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+    if (!term) return makeError("sum 需要被求和的通项");
+
+    Detail::SumLimits limits;
+    std::string message;
+    if (!parseRange(range, &limits, &message)) return makeError(message);
+    if (variable && variable->kind() == NodeKind::Symbol) limits.variable = variable->symbolId();
+
+    Ptr value = Detail::summation(term, limits);
+    if (!value) {
+        return makeError("无法求出闭式；该和式超出当前支持的规则集（多项式、几何级数、p 级数与有限展开）");
+    }
+    result = makeResult(value, m_unicodeOutput);
+    if (result.ok) m_lastResult = result.text;
+    return result;
+}
+
+Result Engine::convergeCommand(const Detail::Ptr &term, const Detail::Ptr &range) {
+    Result result;
+    Timer timer(&result.elapsedMs);
+    if (!term) return makeError("converge 需要级数的通项");
+
+    Detail::SumLimits limits;
+    std::string message;
+    if (!parseRange(range, &limits, &message)) return makeError(message);
+    if (!limits.upper || limits.upper->kind() != NodeKind::Constant ||
+        limits.upper->constant() != ConstantId::Infinity) {
+        return makeError("converge 只对无穷级数有意义，上限请写 oo");
+    }
+
+    Detail::Convergence verdict = Detail::Convergence::Unknown;
+    Ptr value = Ptr();
+    const bool decided = Detail::seriesConvergence(term, limits, &verdict, &value);
+
+    std::string text;
+    if (!decided || verdict == Detail::Convergence::Unknown) {
+        text = "无法判定敛散性";
+    } else if (verdict == Detail::Convergence::Divergent) {
+        text = "发散";
+    } else {
+        text = "收敛";
+        if (value) text += "，和为 " + render(value);
+    }
+
+    result.text = text;
+    result.latex = "\\text{" + text + "}";
+    result.ok = true;
+    m_lastResult = text;
+    return result;
+}
+
 /* -------------------------------------------------------------- 命令分发 */
+
+/** @brief 可作为子表达式出现的矩阵命令（结果需要以矩阵文本形式回填）。 */
+bool isMatrixCommand(const std::string &name) {
+    return name == "det" || name == "determinant" || name == "inv" || name == "inverse" ||
+           name == "invert" || name == "transpose" || name == "trans" || name == "trace" ||
+           name == "tr" || name == "matmul" || name == "dot" || name == "identity" || name == "eye" ||
+           name == "rref" || name == "charpoly" || name == "eigenvals" || name == "eigenvalues" ||
+           name == "rank";
+}
+
+/**
+ * @brief 可作为子表达式出现的标量命令（返回普通表达式文本）。
+ *
+ * `sum(i, i=1..n)`、`bernoulli(6)` 这类命令既能单独使用，也会嵌在
+ * `simplify(...)`、`sum(...) + sum(...)` 里；必须允许内层求值，
+ * 否则整条表达式只会原样回显。
+ */
+bool isScalarCommand(const std::string &name) {
+    return name == "sum" || name == "summation" || name == "converge" || name == "converges" ||
+           name == "bernoulli" || name == "guess" || name == "specialsimplify" ||
+           name == "specialsimp" || name == "spsimp";
+}
+
+/** @brief 可作为子表达式出现、需要内层求值的命令（矩阵 + 标量）。 */
+bool isResolvableCommand(const std::string &name) {
+    return isMatrixCommand(name) || isScalarCommand(name);
+}
+
+/** @brief `range` 只是区间写法 `i=1..n` 的内部表示，不是真正的求值命令。 */
+bool isRangeMarker(const std::string &name) { return name == "range" || name == "equal"; }
+
+/**
+ * @brief 表达式树里是否还留着未求值的命令调用。
+ *
+ * `resolveCommands` 会在某个内层命令求值失败时停下来；此时改写后的文本里仍会
+ * 留下 `命令名(...)` 形态的片段，重新解析再分发只会得到同样的失败。这里用于在
+ * 重新求值前判断"是否真的已经做到底了"，避免无意义的重解析。
+ */
+bool hasPendingCommand(const Ptr &node) {
+    if (!node) return false;
+    if (node->kind() == NodeKind::Function && node->name()) {
+        const std::string name = node->name();
+        // `range/equal` 是区间写法的内部节点，不是"未求值的命令"
+        if (!isRangeMarker(name) && isResolvableCommand(name)) return true;
+    }
+    for (NodePtr child : node->operands()) {
+        if (hasPendingCommand(Ptr::borrow(child))) return true;
+    }
+    return false;
+}
 
 Result Engine::evaluate(const std::string &input) {
     const std::string text = trim(input);
@@ -513,11 +839,45 @@ Result Engine::evaluate(const std::string &input) {
             // dispatch 只在"不认识这个函数名"时返回空 message 且 ok=false
             if (dispatched.ok || !dispatched.message.empty()) return dispatched;
         }
+        // 内层也可能有矩阵命令：det(inv(A))、matmul(A,B) 等
+        std::string rewritten;
+        const bool hit = resolveCommands(parsed.expression, &rewritten);
+        if (!hit && hasPendingCommand(parsed.expression)) {
+            // 内层命令确实存在，但求值失败（典型：inv 遇到奇异矩阵）。
+            // 直接化简只会原样回显命令，用户看不出哪里错了，这里给出明确诊断。
+            return makeError("内层矩阵命令无法求值；请检查参数（例如 inv 的矩阵是否可逆）");
+        }
+        if (hit && !rewritten.empty() && rewritten != text) {
+            Result result;
+            Timer timer(&result.elapsedMs);
+
+            // 整个表达式被内层命令替换成了矩阵：保持矩阵渲染，不再走化简
+            if (rewritten[0] == kMatrixMark) {
+                Detail::SymbolicMatrix matrix;
+                if (parseMatrixText(rewritten, &matrix)) {
+                    result = makeMatrixResult(matrix, m_unicodeOutput);
+                    m_lastResult = result.text;
+                    return result;
+                }
+            }
+
+            // 标量/混合结果：重新解析求值。若改写文本里还有命令残留，说明是求值失败，直接报错。
+            const std::string plain = stripMatrixMark(rewritten);
+            const ParseResult again = parseExpression(plain);
+            if (again.ok && hasPendingCommand(again.expression)) {
+                return makeError("内层矩阵命令无法求值：" + plain);
+            }
+            result = evaluate(plain);
+            if (result.ok) m_lastResult = result.text;
+            return result;
+        }
         Result simplified;
         Timer timer(&simplified.elapsedMs);
         // 先做三角/特殊角折叠，再做通用化简；三角化简失败时回退到纯代数化简
         Ptr value = Detail::trigSimplify(parsed.expression);
         if (!value) value = Detail::simplify(parsed.expression);
+        // 最后折叠特殊函数（Γ(n)、BesselJ(0,0) 之类）
+        value = Detail::simplifySpecial(value);
         simplified = makeResult(value, m_unicodeOutput);
         if (simplified.ok) m_lastResult = simplified.text;
         return simplified;
@@ -550,6 +910,42 @@ std::string Engine::helpText() {
         "  resultant(p, q [, var])     Resultant\n"
         "  latex(expr)                 输出 LaTeX\n"
         "\n"
+        "线性代数（矩阵写作 [[1,2],[3,4]]，结果可与绝对值命令嵌套）：\n"
+        "  det(A)                      行列式\n"
+        "  inv(A)                      逆矩阵（奇异时报错）\n"
+        "  transpose(A)                转置\n"
+        "  trace(A)                    迹（仅方阵）\n"
+        "  matmul(A, B)                矩阵乘法\n"
+        "  rank(A) / rref(A)           秩 / 行最简形\n"
+        "  charpoly(A [, var])         特征多项式\n"
+        "  eigenvals(A)                特征值\n"
+        "  identity(n)                 n 阶单位阵\n"
+        "\n"
+        "特殊函数（自动折叠已知值，未知值保持符号形式）：\n"
+        "  gamma(z)                    Γ 函数（整数、半整数、极点）\n"
+        "  factorial(n) / n!           阶乘\n"
+        "  factorial2(n) / n!!         双阶乘\n"
+        "  beta(a, b)                  B 函数\n"
+        "  binomial(n, k)              组合数\n"
+        "  harmonic(n [, r])           谐波数 H_n / 广义 H_n^(r)\n"
+        "  erf(z) / erfc(z) / erfi(z)  误差函数\n"
+        "  Ei(z) / li(z)               指数积分、对数积分\n"
+        "  besselj(n, z) 等            Bessel 函数 J/Y/I/K\n"
+        "  bernoulli(n)                伯努利数 B_n\n"
+        "  specialsimplify(expr)       折叠表达式中的特殊函数\n"
+        "\n"
+        "级数求和（区间写作 i=1..n，上限 oo 表示无穷）：\n"
+        "  sum(term, i=1..n)           幂和、p 级数、几何、算术-几何、裂项\n"
+        "  converge(term, i=1..oo)     判别敛散性并给出收敛时的和\n"
+        "  guess([a1, a2, ...])        由前几项猜通项公式\n"
+        "\n"
+        "常微分方程（未知函数默认 y，自变量默认 x；撇号 y' / y'' 表示导数）：\n"
+        "  dsolve(eq)                  求解 ODE，eq 形如 y' = y、y'' + y = 0\n"
+        "  dsolve(eq, y)               指定未知函数\n"
+        "  dsolve(eq, y, t)            指定自变量\n"
+        "  一阶：可分离变量、一阶线性、齐次型（u = y/x）、伯努利方程\n"
+        "  二阶：常系数线性（齐次三情形 + 待定系数法非齐次，含共振时乘 x）\n"
+        "\n"
         "直接输入表达式则做化简；支持 2x、3(x+1)、(x+1)(x-1)、x^2、sin(x) 等写法。\n"
         "REPL 中：help 显示帮助，quit 退出，unicode on/off 切换输出字符集。";
 }
@@ -566,11 +962,174 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
     auto text = [&argument](std::size_t index) { return render(argument(index)); };
 
     if (name == "simplify" || name == "simp") return simplify(text(0));
+    if (name == "specialsimplify" || name == "specialsimp" || name == "spsimp") {
+        const ParseResult parsed = parseExpression(text(0));
+        if (!parsed.ok) return makeError(parsed.message, parsed.position);
+        Ptr value = Detail::simplifySpecial(Detail::simplify(parsed.expression));
+        return makeResult(value, m_unicodeOutput);
+    }
+    if (name == "sum" || name == "summation") return sumCommand(argument(0), argument(1), argument(2));
+    if (name == "converge" || name == "converges") return convergeCommand(argument(0), argument(1));
+    if (name == "bernoulli") {
+        long long index = 0;
+        if (!argument(0) || !argument(0)->isSmallInteger(&index) || index < 0) {
+            return makeError("bernoulli 需要一个非负整数下标");
+        }
+        Ptr value = Detail::bernoulliNumber(index);
+        if (!value) return makeError("伯努利数下标过大");
+        return makeResult(value, m_unicodeOutput);
+    }
+    if (name == "guess") {
+        const Ptr list = argument(0);
+        if (!isListNode(list)) return makeError("guess 需要一个序列，如 guess([1,4,9,16,25])");
+        Memory::Vector<Ptr> terms;
+        for (NodePtr cell : list->operands()) {
+            const ParseResult parsed = parseExpression(render(Ptr::borrow(cell)));
+            terms.push_back(parsed.ok ? Detail::simplify(parsed.expression) : Ptr::borrow(cell));
+        }
+        const std::string indexName = count > 1 ? variableName(argument(1)) : "n";
+        Ptr guess = Detail::guessSequence(terms, internSymbol(indexName));
+        if (!guess) return makeError("无法从给定项识别通项");
+        return makeResult(guess, m_unicodeOutput);
+    }
     if (name == "expand") return expand(text(0));
     if (name == "factor") return factor(text(0));
     if (name == "together") return together(text(0));
     if (name == "trigsimp" || name == "trigSimplify" || name == "trigs") return trigSimplify(text(0));
     if (name == "latex") return toLatexResult(text(0));
+
+    // 参数里套着未求值的命令（det(inv(A))）：交给 evaluate 的内层求值流程处理
+    if (isMatrixCommand(name)) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const Ptr child = argument(index);
+            if (child && child->kind() == NodeKind::Function && child->name() &&
+                isMatrixCommand(child->name())) {
+                Result deferred;
+                deferred.ok = false;
+                deferred.message.clear();
+                return deferred;
+            }
+        }
+    }
+
+    if (name == "det" || name == "determinant") {
+        if (count == 0) return makeError("det 需要一个矩阵参数，如 det([[1,2],[3,4]])");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        if (!matrix.isSquare()) return makeError("行列式只对非空方阵有定义");
+        Result result;
+        Timer timer(&result.elapsedMs);
+        result = makeResult(Detail::determinant(matrix), m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "inv" || name == "inverse" || name == "invert") {
+        if (count == 0) return makeError("inv 需要一个方阵参数，如 inv([[1,2],[3,4]])");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        if (!matrix.isSquare()) return makeError("逆矩阵只对方阵有定义");
+        Detail::SymbolicMatrix inverted;
+        const Ptr determinantValue = Detail::inverse(matrix, &inverted);
+        if (!determinantValue) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        if (isNumericZero(determinantValue)) return makeError("矩阵不可逆（行列式为 0）");
+        Result result = makeMatrixResult(inverted, m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "transpose" || name == "trans") {
+        if (count == 0) return makeError("transpose 需要一个矩阵参数");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        Result result = makeMatrixResult(Detail::transpose(matrix), m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "trace" || name == "tr") {
+        if (count == 0) return makeError("trace 需要一个方阵参数");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        if (!matrix.isSquare()) return makeError("迹只对方阵有定义");
+        Result result = makeResult(Detail::trace(matrix), m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "matmul" || name == "dot") {
+        if (count < 2) return makeError("matmul 需要两个矩阵参数");
+        Detail::SymbolicMatrix left, right;
+        if (!toMatrix(argument(0), &left) || !toMatrix(argument(1), &right)) {
+            return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        }
+        Detail::SymbolicMatrix product = Detail::multiplyMatrices(left, right);
+        if (product.isEmpty()) return makeError("维度不匹配：左矩阵列数必须等于右矩阵行数");
+        Result result = makeMatrixResult(product, m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "identity" || name == "eye") {
+        if (count == 0) return makeError("identity 需要一个阶数，如 identity(3)");
+        const Ptr &size = argument(0);
+        if (!size || !size->isInteger() || size->numerator().isNegative()) {
+            return makeError("identity 的阶数必须是非负整数");
+        }
+        if (!size->numerator().fitsLongLong()) return makeError("identity 的阶数过大");
+        const auto order = static_cast<std::size_t>(size->numerator().toLongLong());
+        if (order == 0) return makeError("identity 的阶数必须大于 0");
+        Result result = makeMatrixResult(Detail::identityMatrix(order), m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "rank") {
+        if (count == 0) return makeError("rank 需要一个矩阵参数");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        std::size_t value = 0;
+        if (!Detail::rank(matrix, &value)) return makeError("无法计算秩");
+        Result result = makeResult(makeNumber(BigInt(static_cast<long long>(value)), BigInt(1)),
+                                   m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "rref") {
+        if (count == 0) return makeError("rref 需要一个矩阵参数");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        Detail::SymbolicMatrix reduced;
+        if (!Detail::reducedRowEchelon(matrix, &reduced, nullptr)) return makeError("无法化简");
+        Result result = makeMatrixResult(reduced, m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "charpoly") {
+        if (count == 0) return makeError("charpoly 需要一个方阵参数");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        if (!matrix.isSquare()) return makeError("特征多项式只对方阵有定义");
+        const std::uint32_t variable = internSymbol(count > 1 ? variableName(argument(1)) : "x");
+        Result result;
+        Timer timer(&result.elapsedMs);
+        result = makeResult(Detail::characteristicPolynomial(matrix, variable), m_unicodeOutput);
+        if (result.ok) m_lastResult = result.text;
+        return result;
+    }
+    if (name == "eigenvals" || name == "eigenvalues") {
+        if (count == 0) return makeError("eigenvals 需要一个方阵参数");
+        Detail::SymbolicMatrix matrix;
+        if (!toMatrix(argument(0), &matrix)) return makeError("无法解析矩阵；请写成 [[1,2],[3,4]] 形式");
+        if (!matrix.isSquare()) return makeError("特征值只对方阵有定义");
+        Memory::Vector<Ptr> values;
+        if (!Detail::eigenvalues(matrix, &values)) return makeError("特征值无法求出（需要高次方程求根）");
+        std::string joined;
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            if (i > 0) joined += ", ";
+            joined += render(values[i]);
+        }
+        Result result;
+        result.ok = true;
+        result.text = "{" + joined + "}";
+        result.latex = "\\{" + joined + "\\}";
+        m_lastResult = result.text;
+        return result;
+    }
 
     if (name == "diff" || name == "differentiate" || name == "derivative") {
         if (count == 0) return makeError("diff 需要至少一个参数");
@@ -643,6 +1202,38 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
         for (NodePtr element : argument(1)->operands()) variables.push_back(toText(element));
         return groebner(polynomials, variables);
     }
+    if (name == "dsolve" || name == "ode") {
+        if (count == 0) return makeError("dsolve 需要一个微分方程，如 dsolve(y' = x*y)");
+        const std::string unknownName = count > 1 ? variableName(argument(1)) : "y";
+        const std::string variableArg = count > 2 ? variableName(argument(2)) : "x";
+        return dsolve(text(0), unknownName, variableArg);
+    }
+    if (name == "odeclassify") {
+        if (count == 0) return makeError("odeclassify 需要一个微分方程");
+        Result result;
+        Timer timer(&result.elapsedMs);
+        const ParseResult parsed = parseExpression(text(0));
+        if (!parsed.ok) return makeError(parsed.message, parsed.position);
+        Ptr left;
+        Ptr right;
+        if (!splitEquation(parsed.expression, &left, &right)) return makeError("方程形式无法识别");
+        Ptr residual = Detail::simplify(makeAdd(left.share(), makeNegate(right)));
+        const std::uint32_t unknownId = symbolOf(count > 1 ? variableName(argument(1)) : "y");
+        const int order = Detail::derivativeOrder(residual, unknownId);
+        std::string description;
+        std::string message;
+        Ptr solution = Detail::solveOde(residual, unknownId,
+                                         symbolOf(count > 2 ? variableName(argument(2)) : "x"),
+                                         &description, &message);
+        result.ok = true;
+        if (solution) {
+            result.text = "阶数 " + std::to_string(order) + "；可识别类型：" + description;
+        } else {
+            result.text = "阶数 " + std::to_string(order) + "；无法识别：" + message;
+        }
+        result.latex = result.text;
+        return result;
+    }
     if (name == "gcd") {
         if (count < 2) return makeError("gcd 需要两个多项式");
         return gcd(text(0), text(1), count > 2 ? variableName(argument(2)) : "x");
@@ -658,6 +1249,114 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
     unknown.ok = false;
     unknown.message.clear();
     return unknown;
+}
+
+/* ---------------------------------------------------------- 内层命令 */
+
+bool Engine::resolveCommands(const Ptr &node, std::string *out) {
+    if (!node || !out) return false;
+
+    // 非函数节点：递归处理子项，任一子项被改写了就按运算符拼回去。
+    // 例如 `sum(i, i=1..10) + sum(i^2, i=1..10)` 的根是 Add，
+    // 必须钻进去才能把两个求和命令都求值。
+    if (node->kind() != NodeKind::Function) {
+        const std::size_t count = node->size();
+        if (count == 0) return false;
+        Memory::Vector<std::string> rewritten;
+        bool changed = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            std::string piece;
+            if (resolveCommands(Ptr::borrow(node->operand(i)), &piece)) {
+                rewritten.push_back(piece);
+                changed = true;
+            } else {
+                rewritten.push_back(render(Ptr::borrow(node->operand(i))));
+            }
+        }
+        if (!changed) return false;
+        switch (node->kind()) {
+        case NodeKind::Add:
+        case NodeKind::Mul: {
+            const char *op = node->kind() == NodeKind::Add ? " + " : "*";
+            std::string built;
+            for (std::size_t i = 0; i < rewritten.size(); ++i) {
+                if (i > 0) built += op;
+                built += rewritten[i];
+            }
+            *out = built;
+            return true;
+        }
+        case NodeKind::Pow: {
+            if (rewritten.size() != 2) return false;
+            *out = "(" + rewritten[0] + ")^(" + rewritten[1] + ")";
+            return true;
+        }
+        default:
+            return false;
+        }
+    }
+
+    const std::string name = node->name() ? node->name() : std::string();
+
+    // `sum`/`converge` 的区间实参 `i=1..n` 会被解析成内部的 `range(i,1,n)`，
+    // 它不是普通表达式，render 之后既不能回写成 `i=1..n`、重新 dispatch 也认不出。
+    // 所以这两个命令直接整棵调用渲染后分发，不做实参级重建。
+    if (name == "sum" || name == "summation" || name == "converge" || name == "converges") {
+        const std::string callText = render(node);
+        const ParseResult parsedCall = parseExpression(stripMatrixMark(callText));
+        if (!parsedCall.ok || parsedCall.expression->kind() != NodeKind::Function) return false;
+        const Result outcome = dispatch(name, parsedCall.expression.get(), callText);
+        if (!outcome.ok) return false;
+        *out = outcome.text;
+        return true;
+    }
+
+    // 先把子节点逐个求值成文本，顺带收集
+    Memory::Vector<std::string> parts;
+    bool childChanged = false;
+    for (std::size_t i = 0; i < node->size(); ++i) {
+        const Ptr child = Ptr::borrow(node->operand(i));
+        std::string rendered;
+        if (resolveCommands(child, &rendered)) {
+            parts.push_back(rendered);
+            childChanged = true;
+        } else {
+            parts.push_back(render(child));
+        }
+    }
+
+    if (!isResolvableCommand(name)) {
+        if (!childChanged) return false;
+        // 普通函数：按"函数名(实参...)"重建，实参用改写后的文本
+        std::string rebuilt = name + std::string("(");
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) rebuilt += ", ";
+            rebuilt += parts[i];
+        }
+        rebuilt += ")";
+        *out = rebuilt;
+        return true;
+    }
+
+    // 该节点本身就是命令：用"文本实参"重建一次调用，交给 dispatch
+    std::string callText = name + std::string("(");
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) callText += ", ";
+        callText += parts[i];
+    }
+    callText += ")";
+
+    // 子节点已经在上面递归处理过了，这里不再递归整体文本（否则会无限套娃）
+    // 直接分发到该命令本身（不能再走 evaluate，否则会回到这里形成递归）
+    const ParseResult parsedCall = parseExpression(stripMatrixMark(callText));
+    if (!parsedCall.ok || parsedCall.expression->kind() != NodeKind::Function) return false;
+    const Result outcome = dispatch(name, parsedCall.expression.get(), callText);
+    if (!outcome.ok) return false;
+
+    // 矩阵结果的渲染文本自带标记，原样回填：标记是"这段文本代表矩阵"的凭据，
+    // 上层的 toMatrix 与最终的 evaluate 都靠它区分矩阵与普通列表。
+    *out = outcome.text;
+    return true;
 }
 
 /* -------------------------------------------------------------- 内存 */

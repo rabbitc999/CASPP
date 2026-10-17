@@ -96,6 +96,26 @@ Ptr derivativeOf(const Ptr &expression, std::uint32_t variable) {
 
     case NodeKind::Function: {
         const char *name = expression->name();
+        if (!name) return Ptr();
+
+        // 导数节点 `Derivative(y, x, n)`：求导就是升一阶。
+        // ODE 求解把未知函数写成这类节点，隐式解的校验与初值代入都要用到。
+        if (std::strcmp(name, "Derivative") == 0) {
+            if (expression->size() < 2) return Ptr();
+            Ptr target = argumentOf(expression, 0);
+            Ptr variableArg = argumentOf(expression, 1);
+            if (!target || !variableArg || variableArg->kind() != NodeKind::Symbol) return Ptr();
+            if (variableArg->symbolId() != variable) return integer(0);
+            long long order = 1;
+            if (expression->size() >= 3) {
+                if (!argumentOf(expression, 2)->isSmallInteger(&order)) return Ptr();
+            }
+            Ptr nextOrder = integer(order + 1);
+            return Ptr(Node::makeFunction(
+                "Derivative",
+                Memory::Vector<NodePtr>{target.get(), variableArg.get(), nextOrder.get()}));
+        }
+
         Ptr inner = argumentOf(expression, 0);
         if (!inner) return Ptr();
         Ptr innerDerivative = derivativeOf(inner, variable);
@@ -163,6 +183,89 @@ bool linearForm(const Ptr &expression, std::uint32_t variable, Ptr *slope, Ptr *
 }
 
 Ptr integrateRecursive(const Ptr &expression, std::uint32_t variable, int depth = 0);
+
+/**
+ * @brief 取"复合结构"的内层，用于换元。
+ *
+ * 只认这几种外形（其余返回空）：
+ * - `e^{g(x)}`、`a^{g(x)}`（指数）
+ * - `g(x)^n`（n 为数值且 g 非常数）
+ * - `sin(g)`/`cos(g)`/`tan(g)`/`log(g)`/`sqrt(g)` 等一元函数
+ *
+ * @return 内层 `g(x)`；不是复合结构时返回空。
+ */
+Ptr compositeInnerOf(const Ptr &factor, std::uint32_t variable) {
+    if (!factor || !dependsOn(factor.get(), variable)) return Ptr();
+    if (factor->kind() == NodeKind::Pow) {
+        Ptr base = Ptr::borrow(factor->operand(0));
+        Ptr exponent = Ptr::borrow(factor->operand(1));
+        // 指数形：a^{g(x)}，内层是 g(x)
+        if (dependsOn(exponent.get(), variable) && !dependsOn(base.get(), variable)) return exponent;
+        // 幂形：g(x)^n，内层是 g(x)（要求 base 不是纯变量）
+        if (!dependsOn(exponent.get(), variable) && dependsOn(base.get(), variable) &&
+            !(base->kind() == NodeKind::Symbol && base->symbolId() == variable)) {
+            return base;
+        }
+        return Ptr();
+    }
+    if (factor->kind() == NodeKind::Function) {
+        const char *name = factor->name();
+        if (!name || factor->size() < 1) return Ptr();
+        static const char *kUnary[] = {"sin", "cos", "tan", "cot", "sec", "csc",
+                                       "log", "exp", "sqrt", "asin", "acos", "atan"};
+        bool unary = false;
+        for (const char *candidate : kUnary) {
+            if (std::strcmp(name, candidate) == 0) {
+                unary = true;
+                break;
+            }
+        }
+        if (!unary) return Ptr();
+        Ptr argument = Ptr::borrow(factor->operand(0));
+        if (!argument || !dependsOn(argument.get(), variable)) return Ptr();
+        if (argument->kind() == NodeKind::Symbol && argument->symbolId() == variable) return Ptr();
+        return argument;
+    }
+    return Ptr();
+}
+
+/** @brief 按子树结构替换：把 expression 里所有与 pattern 相等的子树换成 replacement。 */
+Ptr replaceSubtree(const Ptr &expression, const Ptr &pattern, const Ptr &replacement) {
+    if (!expression || !pattern || !replacement) return Ptr();
+    if (expression->equals(pattern.get())) return replacement;
+    if (expression->kind() == NodeKind::Symbol || expression->kind() == NodeKind::Integer ||
+        expression->kind() == NodeKind::Rational || expression->kind() == NodeKind::Constant) {
+        return expression;
+    }
+    Memory::Vector<Ptr> holders;
+    Memory::Vector<NodePtr> children;
+    bool changed = false;
+    for (NodePtr child : expression->operands()) {
+        Ptr original = Ptr::borrow(child);
+        Ptr next = replaceSubtree(original, pattern, replacement);
+        if (!next) return Ptr();
+        if (!next->equals(original.get())) changed = true;
+        holders.push_back(next);
+        children.push_back(next.get());
+    }
+    if (!changed) return expression;
+    switch (expression->kind()) {
+    case NodeKind::Add:
+        return makeAddMany(children);
+    case NodeKind::Mul:
+        return makeMulMany(children);
+    case NodeKind::Pow:
+        if (children.size() != 2) return Ptr();
+        return makePow(holders[0], holders[1]);
+    case NodeKind::Function: {
+        const char *name = expression->name();
+        if (!name) return Ptr();
+        return Ptr(Node::makeFunction(name, children));
+    }
+    default:
+        return Ptr();
+    }
+}
 
 /**
  * @brief 分部积分：`∫ u·dv = u·v - ∫ v·du`。
@@ -276,6 +379,38 @@ Ptr integrateRecursive(const Ptr &expression, std::uint32_t variable, int depth)
             }
         }
         if (varying.empty()) return makeMul(expression, variableNode(variable));
+
+        // 一般换元：∫ F(g(x))·g'(x) dx = ∫ F(u) du（先于常数提取尝试，
+        // 否则 `2·x·e^{x²}` 在常数分支里就走不到换元了）。
+        if (depth < 3 && varying.size() >= 2) {
+            for (std::size_t i = 0; i < varying.size(); ++i) {
+                Ptr factor = Ptr::borrow(varying[i]);
+                Ptr compositeInner = compositeInnerOf(factor, variable);
+                if (!compositeInner) continue;
+                Ptr innerDerivative = derivativeOf(compositeInner, variable);
+                if (!innerDerivative) continue;
+                Memory::Vector<NodePtr> restFactors;
+                Memory::Vector<Ptr> restHolders;
+                for (std::size_t j = 0; j < varying.size(); ++j) {
+                    if (i == j) continue;
+                    restFactors.push_back(varying[j]);
+                    restHolders.push_back(Ptr::borrow(varying[j]));
+                }
+                Ptr rest = restFactors.size() == 1 ? restHolders.front() : makeMulMany(restFactors);
+                if (!rest) continue;
+                Ptr ratio = simplify(makeDivide(rest, innerDerivative));
+                if (!ratio || dependsOn(ratio.get(), variable)) continue;
+                const std::uint32_t substitutionSymbol = internSymbol("__u");
+                Ptr replaced = replaceSubtree(factor, compositeInner, variableNode(substitutionSymbol));
+                if (!replaced) continue;
+                Ptr anti = integrateRecursive(replaced, substitutionSymbol, depth + 1);
+                if (!anti) continue;
+                Ptr back = replaceSubtree(anti, variableNode(substitutionSymbol), compositeInner);
+                if (!back) continue;
+                return makeMul(constant, makeMul(ratio, back));
+            }
+        }
+
         if (!isInt(constant, 1)) {
             if (varying.size() == 1) {
                 Ptr inner = integrateRecursive(Ptr::borrow(varying.front()), variable, depth);

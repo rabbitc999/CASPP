@@ -20,6 +20,7 @@
  */
 
 #include "cas/allocator.h"
+#include "cas/memory.h"
 
 #include <cstddef>
 #include <string>
@@ -31,6 +32,7 @@ namespace Cas {
 namespace Detail {
 class Node;
 class Ptr;
+using NodePtr = Node *;
 } // namespace Detail
 
 /** @brief 一次计算的返回值。 */
@@ -82,6 +84,15 @@ public:
     Result gcd(const std::string &left, const std::string &right, const std::string &variable = "x");
     Result resultant(const std::string &left, const std::string &right, const std::string &variable = "x");
     Result groebner(const std::vector<std::string> &polynomials, const std::vector<std::string> &variables);
+    /**
+     * @brief 解常微分方程。
+     *
+     * @param equation 方程，如 `y' = x*y`、`y'' + y = 0`（`=` 可省略，缺省视为 = 0）。
+     * @param unknown  未知函数名，缺省 `y`。
+     * @param variable 自变量名，缺省 `x`。
+     */
+    Result dsolve(const std::string &equation, const std::string &unknown = "y",
+                  const std::string &variable = "x");
 
     /* ------------------------------------------------------ 工具 */
 
@@ -105,11 +116,31 @@ private:
     /** @brief 按命令名分发到具体方法；不认识返回 message 为空的 Result。 */
     Result dispatch(const std::string &name, const Detail::Node *call, const std::string &source);
 
+    /**
+     * @brief 把表达式里内嵌的矩阵命令就地求值，输出改写后的文本。
+     *
+     * `det(inv(A))`、`matmul(A, B)` 这类写法里，内层命令在简化流程中只是普通的
+     * 未定义函数。这里自底向上（后序遍历）把它们替换成结果文本，再由调用方重新解析，
+     * 从而不必在引擎内部手工维护表达式树的引用计数。
+     * @return 是否有任意一层被替换。
+     */
+    bool resolveCommands(const Detail::Ptr &node, std::string *out);
+
     /* 节点直传版本：避免先把参数渲染成文本再重新解析，从而丢失结构 */
     Result derivativeOfNode(const Detail::Ptr &expression, const std::string &variable);
     Result limitOfNode(const Detail::Ptr &expression, const Detail::Ptr &point, const std::string &variable);
     Result taylorOfNode(const Detail::Ptr &expression, const Detail::Ptr &point, int order,
                         const std::string &variable);
+
+    /**
+     * @brief `sum(term, i=a..b)` 的实现。
+     *
+     * `term` 是已经解析好的表达式（未求值，保留对求和变量的依赖），
+     * `range` 是 `i=a..b` 这样的区间写法，`variable` 是可选的显式变量名。
+     */
+    Result sumCommand(const Detail::Ptr &term, const Detail::Ptr &range, const Detail::Ptr &variable);
+    /** @brief `converge(term, i=a..oo)` 的实现：判定级数敛散性。 */
+    Result convergeCommand(const Detail::Ptr &term, const Detail::Ptr &range);
 
     bool m_unicodeOutput = false;
     std::string m_lastResult;
