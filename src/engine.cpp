@@ -937,7 +937,9 @@ Result Engine::solveSystem(const std::vector<std::string> &equations, const std:
     for (const std::string &name : variables) ids.push_back(symbolOf(name));
 
     Memory::Vector<Memory::Vector<Ptr>> rows;
+    bool linearPossible = true; // 一旦发现高次项/非多项式就降级到非线性路径
     for (const std::string &line : equations) {
+        if (!linearPossible) break;
         const ParseResult parsed = parseExpression(line);
         if (!parsed.ok) return makeError("方程解析失败：" + parsed.message, parsed.position);
         Ptr left, right;
@@ -950,32 +952,133 @@ Result Engine::solveSystem(const std::vector<std::string> &equations, const std:
         Memory::Vector<Ptr> row;
         row.reserve(ids.size() + 1);
         Ptr remainder = expanded; // 始终维护"尚未取系数的部分"
-        for (std::size_t i = 0; i < ids.size(); ++i) {
+        for (std::size_t i = 0; i < ids.size() && linearPossible; ++i) {
             UnivariatePoly poly;
-            if (!toPolynomial(remainder.get(), ids[i], &poly)) {
-                return makeError("当前只支持线性方程组（含非线性项）");
+            if (!toPolynomial(remainder.get(), ids[i], &poly) || poly.degree() > 1) {
+                linearPossible = false; // 有高次项或是非多项式，交给三角消元
+                break;
             }
-            if (poly.degree() > 1) return makeError("当前只支持线性方程组（次数超过 1）");
             Ptr coefficient = poly.degree() == 1 ? poly.coefficient(1) : Ptr(Node::makeInteger(BigInt(0)));
             row.push_back(coefficient);
             // 剥掉这一项，剩下的只含后续变量与常数
             remainder = Detail::simplify(
                 makeAdd(remainder.share(), makeNegate(makeMul(coefficient.share(), idx(ids[i])))));
         }
+        if (!linearPossible) break;
         // 剩余部分即常数项 c，方程形如 Σ aᵢxᵢ + c = 0 → 右端项取 -c
         row.push_back(makeNegate(remainder));
         rows.push_back(row);
     }
 
-    Memory::Vector<Ptr> solution;
-    if (!solveLinearSystem(rows, ids, &solution)) return makeError("方程组无唯一解（奇异或不相容）");
-
-    std::string text;
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        if (i) text += ", ";
-        const char *name = symbolName(ids[i]);
-        text += std::string(name ? name : "x") + " = " + toText(solution[i].get());
+    if (linearPossible) {
+        Memory::Vector<Ptr> solution;
+        if (solveLinearSystem(rows, ids, &solution)) {
+            std::string text;
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (i) text += ", ";
+                const char *name = symbolName(ids[i]);
+                text += std::string(name ? name : "x") + " = " + toText(solution[i].get());
+            }
+            result.ok = true;
+            result.text = text;
+            result.latex = text;
+            return result;
+        }
+        // 线性路径失败：可能是欠定/不相容，也可能其实是非线性的特例，继续往下试
     }
+
+    // ---- 非线性：交给三角消元（Groebner 基 + 代回剪枝）
+    Result nonlinear = solveNonlinearSystem(equations, variables);
+    if (nonlinear.ok) return nonlinear;
+    // 两条路径都失败时，如果线性路径已经能判定欠定/不相容，给出更准确的说法
+    if (linearPossible) return makeError("方程组无唯一解（奇异或不相容）");
+    return nonlinear;
+}
+
+Result Engine::solveNonlinearSystem(const std::vector<std::string> &equations,
+                                    const std::vector<std::string> &variables) {
+    Memory::Vector<std::uint32_t> ids;
+    ids.reserve(variables.size());
+    for (const std::string &name : variables) ids.push_back(symbolOf(name));
+
+    Memory::Vector<Ptr> polynomials;
+    for (const std::string &line : equations) {
+        const ParseResult parsed = parseExpression(line);
+        if (!parsed.ok) return makeError("方程解析失败：" + parsed.message, parsed.position);
+        Ptr left, right;
+        if (!splitEquation(parsed.expression, &left, &right)) return makeError("方程形式无法识别");
+        polynomials.push_back(Detail::simplify(makeAdd(left.share(), makeNegate(right))));
+    }
+
+    Result result;
+    Timer timer(&result.elapsedMs);
+    Memory::Vector<Detail::SystemSolution> solutions;
+    if (!Detail::solveSystemNonlinear(polynomials, ids, &solutions)) {
+        return makeError("方程组超出求解范围（需要有理系数的多项式方程，且分支数不超过 64）");
+    }
+
+    if (solutions.empty()) {
+        result.ok = true;
+        result.text = "无解";
+        result.latex = result.text;
+        return result;
+    }
+
+    // 每个分支写成一行：x = a, y = b
+    std::string text;
+    bool allComplete = true;
+    for (const Detail::SystemSolution &branch : solutions) {
+        if (!branch.complete) allComplete = false;
+    }
+    for (std::size_t index = 0; index < solutions.size(); ++index) {
+        const Detail::SystemSolution &branch = solutions[index];
+        std::string line;
+        // 收集所有已赋值的变量，用来判断哪些是自由变量
+        auto assignedTo = [&branch](std::uint32_t id) -> Detail::Ptr {
+            for (const auto &assignment : branch.assignments) {
+                if (assignment.first == id) return assignment.second;
+            }
+            return Detail::Ptr();
+        };
+        std::string freeNames;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (assignedTo(ids[i])) continue;
+            const char *name = symbolName(ids[i]);
+            if (!freeNames.empty()) freeNames += ", ";
+            freeNames += std::string(name ? name : "x");
+        }
+
+        if (branch.complete) {
+            // 按用户给的变量顺序输出
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (i) line += ", ";
+                const char *name = symbolName(ids[i]);
+                line += std::string(name ? name : "x") + " = ";
+                Detail::Ptr value = assignedTo(ids[i]);
+                if (value) {
+                    line += toText(Detail::simplify(Detail::expand(value)).get());
+                } else {
+                    line += "?";
+                }
+            }
+        } else {
+            // 欠定分支：已定的变量写成等式，未定的就是自由变量
+            bool first = true;
+            for (const auto &assignment : branch.assignments) {
+                const char *name = symbolName(assignment.first);
+                if (!first) line += ", ";
+                first = false;
+                line += std::string(name ? name : "x") + " = " +
+                        toText(Detail::simplify(Detail::expand(assignment.second)).get());
+            }
+            if (line.empty() && !freeNames.empty()) line = freeNames + " 未定（解不唯一，构成参数解）";
+            if (line.empty()) line = "任意值都是解";
+        }
+        if (index) text += "; ";
+        text += line;
+    }
+    if (!allComplete) text = "存在自由变量：" + text;
+
     result.ok = true;
     result.text = text;
     result.latex = text;
@@ -1037,7 +1140,8 @@ Result Engine::resultant(const std::string &left, const std::string &right, cons
     return result;
 }
 
-Result Engine::groebner(const std::vector<std::string> &polynomials, const std::vector<std::string> &variables) {
+Result Engine::groebner(const std::vector<std::string> &polynomials, const std::vector<std::string> &variables,
+                       Detail::MonomialOrder order) {
     Result result;
     Timer timer(&result.elapsedMs);
     if (polynomials.empty() || variables.empty()) return makeError("生成元或变量表为空");
@@ -1052,7 +1156,7 @@ Result Engine::groebner(const std::vector<std::string> &polynomials, const std::
         generators.push_back(Detail::expand(parsed.expression));
     }
 
-    const Memory::Vector<Ptr> basis = groebnerBasis(generators, ids);
+    const Memory::Vector<Ptr> basis = groebnerBasis(generators, ids, order);
     std::string text = "{";
     for (std::size_t i = 0; i < basis.size(); ++i) {
         if (i) text += ", ";
@@ -1686,7 +1790,17 @@ Result Engine::dispatch(const std::string &name, const Detail::Node *call, const
         std::vector<std::string> polynomials, variables;
         for (NodePtr element : argument(0)->operands()) polynomials.push_back(toText(element));
         for (NodePtr element : argument(1)->operands()) variables.push_back(toText(element));
-        return groebner(polynomials, variables);
+        // 可选的第三个参数指定单项式序：lex（消元用）或 grevlex（默认）
+        Detail::MonomialOrder order = Detail::MonomialOrder::Grevlex;
+        if (count >= 3) {
+            const std::string keyword = toText(argument(2).get());
+            if (keyword == "lex" || keyword == "Lex" || keyword == "LEX") {
+                order = Detail::MonomialOrder::Lex;
+            } else if (keyword != "grevlex" && keyword != "Grevlex" && keyword != "GREVLEX") {
+                return makeError("groebner 的单项式序只能是 lex 或 grevlex");
+            }
+        }
+        return groebner(polynomials, variables, order);
     }
     if (name == "dsolve" || name == "ode") {
         if (count == 0) return makeError("dsolve 需要一个微分方程，如 dsolve(y' = x*y)");

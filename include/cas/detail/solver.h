@@ -44,6 +44,33 @@ bool solveLinearSystem(const Memory::Vector<Memory::Vector<Ptr>> &equations,
                        const Memory::Vector<std::uint32_t> &variables,
                        Memory::Vector<Ptr> *solution);
 
+/** @brief 一个解分支：每个变量取一个确定值，`complete` 表示是否所有变量都已确定。 */
+struct SystemSolution {
+    Memory::Vector<std::pair<std::uint32_t, Ptr>> assignments; ///< 变量编号 → 值
+    bool complete = false;                                     ///< 所有变量都有确定值
+};
+
+/**
+ * @brief 解多项式方程组（可非线性）。
+ *
+ * 做法是三元组消元（triangular decomposition）：
+ *  1. 把方程组转成 `f = 0` 形式的纯有理系数多项式；
+ *  2. 按**给定变量表从后往前**为每个变量算一次 Groebner 基——最后算的那次
+ *     以该变量为最主元，于是基里必然出现一个只含该变量的多项式，解出来；
+ *  3. 每得到一个根就代回，全体变量减一，递归。代回之后出现矛盾即剪枝，
+ *     所以非根的中间值不会扩散成分支。
+ *
+ * 变量表顺序即消元优先级：`[x, y]` 表示先解 `y`（最后算基），再解 `x`。
+ *
+ * @param polynomials 多项式方程（左端，即 `f = 0`）
+ * @param variables   变量表（顺序即消元优先级）
+ * @param solutions   输出解分支；参数曲面这类欠定情形给出 `complete = false` 的分支
+ * @return 是否成功走完消元流程；遇到非多项式输入返回 false
+ */
+bool solveSystemNonlinear(const Memory::Vector<Ptr> &polynomials,
+                          const Memory::Vector<std::uint32_t> &variables,
+                          Memory::Vector<SystemSolution> *solutions);
+
 } // namespace Cas::Detail
 
 #endif // CAS_DETAIL_SOLVER_H

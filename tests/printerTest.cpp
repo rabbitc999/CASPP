@@ -101,7 +101,7 @@ void testModuleEntries() {
 
     expectText(&engine, "solveSystem([x+y=3, x-y=1], [x, y])", "x = 2, y = 1");
     expectText(&engine, "solve([x+y=3, x-y=1], [x, y])", "x = 2, y = 1");
-    expectText(&engine, "groebner([x^2+y^2-1, x-y], [x, y])", "{y^2 - 1/2, x - y}");
+    expectText(&engine, "groebner([x^2+y^2-1, x-y], [x, y])", "{x - y, y^2 - 1/2}");
 
     // 大小写变体与别名
     expectText(&engine, "solvesystem([x+y=3, x-y=1], [x, y])", "x = 2, y = 1");

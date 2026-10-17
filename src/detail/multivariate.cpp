@@ -38,8 +38,13 @@ int compareMonomial(const Monomial &left, const Monomial &right, MonomialOrder o
 
     const long long leftDegree = totalDegree(left), rightDegree = totalDegree(right);
     if (leftDegree != rightDegree) return leftDegree < rightDegree ? -1 : 1;
+    // Grevlex 的平局规则：从最右（最次要的变量）往左找第一个不同的指数，
+    // **指数小的那个反而更大**。也就是比较"逆字典序"。
+    // 之前写成 `left > right ? -1 : 1`（指数大的更大），方向正好相反，
+    // 于是 x^2*y 会排在 x*y^2 后面，`terms.front()` 拿到的不是真正的首项，
+    // 约化就会约错项，Groebner 基永远算不对。
     for (std::size_t i = size; i-- > 0;) {
-        if (left.exponents[i] != right.exponents[i]) return left.exponents[i] > right.exponents[i] ? -1 : 1;
+        if (left.exponents[i] != right.exponents[i]) return left.exponents[i] < right.exponents[i] ? 1 : -1;
     }
     return 0;
 }
@@ -74,18 +79,6 @@ bool dividesMonomial(const Monomial &divisor, const Monomial &dividend) {
         if (divisor.exponents[i] > dividend.exponents[i]) return false;
     }
     return true;
-}
-
-/** @brief 系数取倒数。 */
-void invertCoefficient(Monomial *monomial) {
-    if (monomial->numerator.isZero()) return;
-    const BigInt numerator = monomial->numerator;
-    monomial->numerator = monomial->denominator;
-    monomial->denominator = numerator;
-    if (monomial->denominator.isNegative()) {
-        monomial->numerator = monomial->numerator.negated();
-        monomial->denominator = monomial->denominator.negated();
-    }
 }
 
 /* ----------------------------------------------------- 多项式基本运算 */
@@ -168,8 +161,8 @@ MultivariatePoly polyScale(const MultivariatePoly &polynomial, const Monomial &m
     return result;
 }
 
-/** @brief 首一化：把首项系数变成 1。 */
-void makeMonic(MultivariatePoly *polynomial) {
+/** @brief 首一化：把首项系数变成 1（保持调用方的单项式序）。 */
+void makeMonic(MultivariatePoly *polynomial, MonomialOrder order = MonomialOrder::Grevlex) {
     if (polynomial->terms.empty()) return;
     Monomial inverse = polynomial->terms.front();
     inverse.exponents.assign(inverse.exponents.size(), 0);
@@ -179,7 +172,9 @@ void makeMonic(MultivariatePoly *polynomial) {
         inverse.numerator = inverse.numerator.negated();
         inverse.denominator = inverse.denominator.negated();
     }
-    *polynomial = polyScale(*polynomial, inverse, MonomialOrder::Grevlex);
+    // 必须沿用调用方的序：写死 Grevlex 会让 Lex 下的首项被重新排到后面，
+    // 于是基元素的首项不再是真正的首项，polyReduce 与 sPolynomial 全部失效。
+    *polynomial = polyScale(*polynomial, inverse, order);
 }
 
 /**
@@ -231,32 +226,42 @@ MultivariatePoly sPolynomial(const MultivariatePoly &left, const MultivariatePol
     const Monomial &a = left.terms.front();
     const Monomial &b = right.terms.front();
 
+    // 单项式的最小公倍：指数逐位取最大，系数取 1。
+    // 系数不能留空（Monomial 默认系数是 0/0），否则下面 divideMonomial
+    // 会除出 0/0，整个 S-多项式恒等于 0，Buchberger 直接退化成"原样返回"。
     Monomial lcm;
     lcm.exponents.reserve(a.exponents.size());
     for (std::size_t i = 0; i < a.exponents.size(); ++i) lcm.exponents.push_back(std::max(a.exponents[i], b.exponents[i]));
+    lcm.numerator = BigInt(1);
+    lcm.denominator = BigInt(1);
 
     Monomial scaleA, scaleB;
-    divideMonomial(lcm, a, &scaleA);
-    divideMonomial(lcm, b, &scaleB);
-    // S = (lcm/lt(f))·f - (lcm/lt(g))·g，系数部分取倒数消去首项系数
-    Monomial a2 = scaleA, b2 = scaleB;
-    invertCoefficient(&a2);
-    invertCoefficient(&b2);
-    // 统一到分母相同：实际只需保证两项首项相同，这里用"乘倒数"即可
-    MultivariatePoly first = polyScale(left, a2, order);
-    MultivariatePoly second = polyScale(right, b2, order);
+    if (!divideMonomial(lcm, a, &scaleA)) return MultivariatePoly();
+    if (!divideMonomial(lcm, b, &scaleB)) return MultivariatePoly();
+    // S = (lcm/lt(f))·f - (lcm/lt(g))·g。
+    // divideMonomial 已经把系数一并除掉（scaleA = lcm / a = 1/lc(f)），
+    // 两项的首项因此都化成 lcm 的系数，相加即相消。不能再额外取一次倒数。
+    MultivariatePoly first = polyScale(left, scaleA, order);
+    MultivariatePoly second = polyScale(right, scaleB, order);
     return polySum(first, polyNegate(second), order);
 }
 
-/** @brief 首项是否被列表中某元素的首项整除（Buchberger 第一判据）。 */
-bool leadingDividedByAny(const MultivariatePoly &candidate, const Memory::Vector<MultivariatePoly> &basis) {
-    if (candidate.terms.empty()) return true;
-    const Monomial &leading = candidate.terms.front();
-    for (const MultivariatePoly &element : basis) {
-        if (element.terms.empty()) continue;
-        if (dividesMonomial(element.terms.front(), leading)) return true;
+/**
+ * @brief Buchberger 第一判据：lcm(lt(f), lt(g)) 恰好等于两者的乘积时，
+ * 该对的 S-多项式必然约化为 0，可以跳过。
+ *
+ * 注意不要和"首项能否被基中某元素整除"混淆——后者是化简判据，
+ * 在 S-多项式尚未约化时套用会把有信息量的对丢掉。
+ */
+bool coprimeLeads(const MultivariatePoly &left, const MultivariatePoly &right) {
+    if (left.terms.empty() || right.terms.empty()) return true;
+    const Monomial &a = left.terms.front();
+    const Monomial &b = right.terms.front();
+    const std::size_t size = std::min(a.exponents.size(), b.exponents.size());
+    for (std::size_t i = 0; i < size; ++i) {
+        if (a.exponents[i] != 0 && b.exponents[i] != 0) return false;
     }
-    return false;
+    return true;
 }
 
 /* ------------------------------------------------------ 表达式 → 多元 */
@@ -299,6 +304,10 @@ bool buildMonomial(const NodePtr &node, const Memory::Vector<std::uint32_t> &var
     }
     case NodeKind::Mul: {
         for (NodePtr factor : node->operands()) {
+            // 注意各因子的系数要**乘**上去，不能共用一个 out：
+            // buildMonomial 会先把 out 清零，若对每个因子复用 out，
+            // 前一个因子的系数就被后一个覆盖了（-12 → 1），
+            // 于是 S-多项式算出来是常数 0，Groebner 基永远消不出元。
             Monomial piece;
             if (!buildMonomial(factor, variables, &piece)) return false;
             for (std::size_t i = 0; i < variables.size(); ++i) out->exponents[i] += piece.exponents[i];
@@ -342,6 +351,14 @@ bool toMultivariate(const NodePtr &expression, const Memory::Vector<std::uint32_
     if (!buildMonomial(expression, variables, &monomial)) return false;
     addTerm(out, monomial, MonomialOrder::Grevlex);
     return true;
+}
+
+/** @brief 按指定序重排多项式（把首项放到最前面）。 */
+MultivariatePoly resort(const MultivariatePoly &polynomial, MonomialOrder order) {
+    MultivariatePoly result = polynomial;
+    std::sort(result.terms.begin(), result.terms.end(),
+              [order](const Monomial &a, const Monomial &b) { return compareMonomial(a, b, order) > 0; });
+    return result;
 }
 
 Ptr fromMultivariate(const MultivariatePoly &polynomial) {
@@ -398,13 +415,29 @@ Memory::Vector<Ptr> groebnerBasis(const Memory::Vector<Ptr> &generators,
         if (!generator) continue;
         MultivariatePoly polynomial;
         if (!toMultivariate(generator.get(), variables, &polynomial)) continue;
+        // toMultivariate 固定按 Grevlex 排；这里必须按本次请求的序重排，
+        // 否则 `terms.front()` 取到的不是该序下的首项，
+        // polyReduce / sPolynomial 就会约错项，基永远算不对。
+        polynomial = resort(polynomial, order);
         normalizePoly(&polynomial, order);
         if (polynomial.isZero()) continue;
-        makeMonic(&polynomial);
+        makeMonic(&polynomial, order);
+        // 去重必须比较**整个多项式**，不能只比首项指数：
+        // `x^2+y^2-10` 与 `x^2-y^2-8` 的项数和首项完全相同，
+        // 只比首项会把后者当重复丢掉，基里就少了独立的一条方程。
         bool duplicate = false;
         for (const MultivariatePoly &existing : basis) {
-            if (existing.terms.size() == polynomial.terms.size() &&
-                existing.terms.front().exponents == polynomial.terms.front().exponents) {
+            if (existing.terms.size() != polynomial.terms.size()) continue;
+            bool same = true;
+            for (std::size_t i = 0; i < existing.terms.size() && same; ++i) {
+                const Monomial &left = existing.terms[i];
+                const Monomial &right = polynomial.terms[i];
+                if (left.exponents != right.exponents || left.numerator != right.numerator ||
+                    left.denominator != right.denominator) {
+                    same = false;
+                }
+            }
+            if (same) {
                 duplicate = true;
                 break;
             }
@@ -428,11 +461,19 @@ Memory::Vector<Ptr> groebnerBasis(const Memory::Vector<Ptr> &generators,
     while (processed < pairs.size()) {
         const auto pair = pairs[processed++];
         if (pair.first >= basis.size() || pair.second >= basis.size()) continue;
+        // Buchberger 第一判据：首项互素的对，S-多项式必定约化为 0，跳过
+        if (coprimeLeads(basis[pair.first], basis[pair.second])) continue;
 
         MultivariatePoly s = sPolynomial(basis[pair.first], basis[pair.second], order);
         normalizePoly(&s, order);
         if (s.isZero()) continue;
-        if (leadingDividedByAny(s, basis)) continue;
+        // 注意：这里**不能**用"首项被基中某元素整除就跳过"。
+        // 那是化简判据，会在 S-多项式尚未约化时把它丢掉——
+        // 例如 [x^2+y^2-25, x*y-12] 的 S = y^3-25y+12x，
+        // 首项 y^3 并不被 x^2 / x*y 整除，但真正的消元多项式
+        // y^4-25y^2+144 恰恰要靠它继续约化出来。
+        // Buchberger 第一判据是 lcm(lt(f),lt(g)) == lt(f)*lt(g)，
+        // 与"能否整除"无关。
 
         Memory::Vector<MultivariatePoly> quotients;
         MultivariatePoly remainder;
@@ -440,7 +481,7 @@ Memory::Vector<Ptr> groebnerBasis(const Memory::Vector<Ptr> &generators,
         normalizePoly(&remainder, order);
         if (remainder.isZero()) continue;
 
-        makeMonic(&remainder);
+        makeMonic(&remainder, order);
         const std::size_t newIndex = basis.size();
         basis.push_back(remainder);
         for (std::size_t i = 0; i < newIndex; ++i) pairs.push_back({i, newIndex});
@@ -448,26 +489,54 @@ Memory::Vector<Ptr> groebnerBasis(const Memory::Vector<Ptr> &generators,
         if (basis.size() > 64) break; // 防御：极端输入下限制规模
     }
 
-    // 约化：用其它元素把每个元素的首项也约掉，得到唯一的约化 Groebner 基
-    Memory::Vector<MultivariatePoly> reduced;
+    // 约化：先删掉首项能被其它元素首项整除的（这些是多余的），
+    // 再把剩下每个元素的首项也约掉，得到唯一的约化 Groebner 基。
+    //
+    // 顺序很重要：不能直接对每个元素做 reduce 再判断余式是否为零。
+    // 当两个生成元互为倍数（如 `x+y-1` 与 `2x+2y-2`）时，
+    // 各自用对方约化都会得到零余式，照原逻辑两个都被丢掉，基就成了空集，
+    // 整个方程组被误判成矛盾。
+    Memory::Vector<bool> redundant(basis.size(), false);
     for (std::size_t i = 0; i < basis.size(); ++i) {
-        Memory::Vector<MultivariatePoly> others;
+        if (basis[i].terms.empty()) {
+            redundant[i] = true;
+            continue;
+        }
         for (std::size_t j = 0; j < basis.size(); ++j) {
-            if (j != i) others.push_back(basis[j]);
+            if (i == j || basis[j].terms.empty()) continue;
+            if (!dividesMonomial(basis[j].terms.front(), basis[i].terms.front())) continue;
+            // 首项互相整除（互为倍数）：只保留索引较小的那个，避免两个都被删掉
+            const bool mutual = dividesMonomial(basis[i].terms.front(), basis[j].terms.front());
+            if (mutual && j > i) continue;
+            redundant[i] = true;
+            break;
+        }
+    }
+
+    Memory::Vector<MultivariatePoly> kept;
+    for (std::size_t i = 0; i < basis.size(); ++i) {
+        if (!redundant[i]) kept.push_back(basis[i]);
+    }
+
+    Memory::Vector<MultivariatePoly> reduced;
+    for (std::size_t i = 0; i < kept.size(); ++i) {
+        Memory::Vector<MultivariatePoly> others;
+        for (std::size_t j = 0; j < kept.size(); ++j) {
+            if (j != i) others.push_back(kept[j]);
         }
         if (others.empty()) {
-            reduced.push_back(basis[i]);
+            reduced.push_back(kept[i]);
             continue;
         }
         Memory::Vector<MultivariatePoly> quotients;
         MultivariatePoly remainder;
-        if (!polyReduce(basis[i], others, order, &quotients, &remainder)) {
-            reduced.push_back(basis[i]);
+        if (!polyReduce(kept[i], others, order, &quotients, &remainder)) {
+            reduced.push_back(kept[i]);
             continue;
         }
         normalizePoly(&remainder, order);
         if (remainder.isZero()) continue;
-        makeMonic(&remainder);
+        makeMonic(&remainder, order);
         reduced.push_back(remainder);
     }
 

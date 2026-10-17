@@ -65,11 +65,11 @@ build/caspp                               # 进入 REPL
 | Taylor 展开 | `taylor(f, 0, n)` | `taylor(cos(x), 0, 6)` |
 | 驻点与极值 | `critical(f [, x])` | `critical(x^3-3x)` → `x = -1（极大值，f = 2）; x = 1（极小值，f = -2）` |
 | 解方程 | `solve(eq, x)` | `solve(x^2-5x+6=0, x)` → `x = 2, x = 3` |
-| 解方程组 | `solve([eq1, eq2], [x, y])` / `solveSystem([eq1, eq2], [x, y])` | 高斯-约当消元 |
+| 解方程组 | `solve([eq1, eq2], [x, y])` / `solveSystem([eq1, eq2], [x, y])` | 线性走高斯-约当消元，非线性走 Groebner 基三角消元 |
 | 不等式 | 直接输入 `>` `<` | `2x+1<3` → `x < 1` |
 | 多项式 GCD | `gcd(p, q)` | |
 | 结式 | `resultant(p, q, x)` | |
-| Groebner 基 | `groebner([f, g], [x, y])` | `{y^2 - 1/2, x - y}` |
+| Groebner 基 | `groebner([f, g], [x, y])` / `groebner([f, g], [x, y], lex)` | `{y^2 - 1/2, x - y}` |
 | 线性代数 | 见下节 | `inv([[1,2],[3,4]])` → `[[-2, 1], [3/2, -1/2]]` |
 | LaTeX | `latex(expr)` | `\frac{1}{x^{1}}` |
 | 内存统计 | `mem` | 池容量/活动字节/峰值 |
@@ -376,6 +376,24 @@ latex([1,2,3])         → \left[1, 2, 3\right]
 `Engine` 直接提供的入口名，否则像 `solveSystem([...], [x, y])` 这种写法会被
 「未知函数」诊断挡下来。
 
+### 方程组的非线性部分
+
+`solveSystem` 先尝试线性路径（每个变量只取一次系数）；只要有方程在某变量上次数超过 1、
+或系数不再是数值，就整体降级到非线性的三角消元：
+
+1. 把方程整理成 `f = 0` 的纯有理系数多项式；
+2. 按变量表逐轮算 Groebner 基（`Lex`），取出只含目标变量的多项式——这就是消元结果；
+3. 求根后代回其余方程，出现非零常数即剪枝，变量减一，递归。
+
+消元方向容易搞反，这里记下实测语义：**变量表末位最主元，被消净的是首位**。
+所以对 `{x^2+y^2-25, xy-12}` 用 `Lex [x, y]` 得到
+`{y^3/12 + x - 25y/12, y^4 - 25y^2 + 144}`——`x` 被消净，剩下只含 `y` 的式子。
+想让哪个变量"留下来"，就把它排在变量表末位。
+
+欠定时（方程数少于未知量）基里不会出现只含某变量的多项式，此时从原方程按一次式解出
+`x = 1 - y` 这类含参表达式，输出「存在自由变量」。`groebner` 也支持显式指定序：
+`groebner([f, g], [x, y], lex)`。
+
 ## 架构
 
 ```
@@ -391,7 +409,7 @@ include/cas/
     simplify.h       makeAdd/makeMul/makePow/makeNegate/simplify
     polynomial.h     一元多项式与 expand/factor/gcd/resultant/together
     calculus.h       diff/integrate/limit/taylor/substitute
-    solver.h         solve/solveInequality/solveLinearSystem
+    solver.h         solve/solveInequality/solveLinearSystem/solveSystemNonlinear
     trigonometry.h   trigsimp 及相关重写规则
     multivariate.h   多元多项式与 Groebner 基
     matrix.h         符号矩阵与线性代数（det/inv/rref/charpoly/eigenvals）
@@ -424,7 +442,7 @@ include/cas/
 
 ## 测试
 
-九套回归测试，`make test` 全绿：
+十套回归测试，`make test` 全绿：
 
 | 测试 | 内容 |
 | --- | --- |
@@ -434,6 +452,7 @@ include/cas/
 | `polynomialTest` | 展开、带余除法、GCD、Resultant、因式分解（含 16 项高次与多元用例）、通分 |
 | `definitionTest` | 变量替换（单/多变量、表达式代入、错误路径）、函数定义（单/多参、嵌套、与 diff/integrate/limit 组合）、常量定义、`defs`/`undef`、定义错误与隐式乘法语义不变 |
 | `printerTest` | 内部节点不外泄（`equal`→`y = x`、`list`→`[1, 2, 3]`，文本与 LaTeX 双路）、`solveSystem` 等模块入口不被「未知函数」诊断误伤、未知函数诊断本身仍生效 |
+| `systemTest` | 方程组求解：线性（含三元、不相容）、非线性两元（圆与双曲线、首项相同的二次式相减、二次+一次、乘积型、仅复根）、非线性三元（对称方程组 6 组排列、圆与坐标轴）、单变量高次、欠定参数解、非多项式方程与被空变量表报错 |
 | `calculusTest` | 141 项：解析、化简、展开、分解、求导、积分（含三角有理式/根式/部分分式）、极限（含幂指型）、Taylor/Laurent、驻点极值、求解、不等式、三角、Groebner、LaTeX、内存 |
 | `matrixTest` | 62 项：行列式、逆、转置、迹、乘法、秩、行最简形、特征多项式、特征值、单位阵、嵌套调用、代数恒等式、LaTeX、非法输入 |
 | `specialTest` | 111 项：Γ（整数/半整数/极点）、阶乘与双阶乘、Beta、组合数、谐波数、erf、Bessel、伯努利数、`specialsimplify`、幂和、p 级数、几何与算术-几何、裂项、敛散性、`guess`、跨模块组合 |
@@ -446,7 +465,10 @@ include/cas/
 - 因式分解在有理域上进行：`x^4+1`、`x^2+y^2`、`x^4+y^4` 这类有理域不可约的式子
   原样返回（不引入代数扩域）；多元分解逐变量轮流做主元，`x^2*y^2-1` 这类需要把
   `x*y` 整体当作一个主元的情形不会拆成 `(x*y - 1)*(x*y + 1)`
-- 求解只覆盖一次、二次方程与线性方程组，高次方程依赖有理根定理
+- 求解覆盖一次、二次方程、高次方程（有理根定理）与多项式方程组；方程组的非线性部分走
+  三角消元（Groebner 基 + 代回剪枝），需要有理系数，含 `sin(x)` 这类超越项直接报「超出求解范围」
+- 非线性方程组的分支上限 64；欠定时给出「存在自由变量」的参数解，不展开成完整解集
+- 方程组的参数解只做一次线性解出（如 `x = 1 - y`），不会为自由变量引入新参数符号
 - 用户定义是**纯文本展开**，不做参数类型检查、没有默认参数、没有条件分支，也不是高阶函数：
   `define(f(g), g(1))` 里的 `g` 只会被当成自由符号
 - 定义展开上限 8 层；`undef` 删除后 `f(1)` 立刻退回隐式乘法 `f*1`

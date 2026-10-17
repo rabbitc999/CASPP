@@ -23,6 +23,7 @@
  */
 
 #include "cas/allocator.h"
+#include "cas/detail/multivariate.h"
 #include "cas/detail/parser.h"
 #include "cas/memory.h"
 
@@ -85,7 +86,6 @@ public:
      * @return 替换并化简后的结果。
      */
     Result substitute(const std::string &expression, const std::string &variable, const std::string &value);
-
     /**
      * @brief 定义函数或常量。
      *
@@ -114,13 +114,33 @@ public:
     Result criticalPoints(const std::string &expression, const std::string &variable = "x");
     /** @brief 解方程；`equation` 可写成 `x^2-1=0` 或 `x^2-1`。 */
     Result solve(const std::string &equation, const std::string &variable = "x");
-    /** @brief 解方程组：`{"x+y=3", "x-y=1"}`。 */
+    /**
+     * @brief 解方程组：`{"x+y=3", "x-y=1"}`。
+     *
+     * 自动选择策略：先按高斯消元试线性；线性路径失败（有高次项、欠定或不相容）
+     * 时转三角消元（Groebner 基 + 代回剪枝），因此支持多项式非线性方程组，
+     * 结果按分支列出，如 `x = 2, y = 3; x = -1, y = -3`。
+     */
     Result solveSystem(const std::vector<std::string> &equations, const std::vector<std::string> &variables);
+    /**
+     * @brief 解多项式方程组（可非线性），直接走三角消元。
+     * @param equations 方程，写成 `f = 0` 或只给左端 `f`
+     * @param variables 变量表，顺序即消元优先级（先解最后一个）
+     */
+    Result solveNonlinearSystem(const std::vector<std::string> &equations,
+                                const std::vector<std::string> &variables);
     /** @brief 解不等式：`x^2-1>0`。 */
     Result solveInequality(const std::string &inequality, const std::string &variable = "x");
     Result gcd(const std::string &left, const std::string &right, const std::string &variable = "x");
     Result resultant(const std::string &left, const std::string &right, const std::string &variable = "x");
-    Result groebner(const std::vector<std::string> &polynomials, const std::vector<std::string> &variables);
+    /**
+     * @brief 计算 Groebner 基。
+     * @param polynomials 生成元
+     * @param variables  变量表（顺序即消元优先级，末位最主元）
+     * @param order      单项式序；`Lex` 便于消元，`Grevlex`（默认）计算更快
+     */
+    Result groebner(const std::vector<std::string> &polynomials, const std::vector<std::string> &variables,
+                    Detail::MonomialOrder order = Detail::MonomialOrder::Grevlex);
     /**
      * @brief 解常微分方程。
      *

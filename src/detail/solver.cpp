@@ -3,10 +3,12 @@
 
 #include "cas/detail/solver.h"
 #include "cas/detail/calculus.h"
+#include "cas/detail/multivariate.h"
 #include "cas/detail/polynomial.h"
 #include "cas/detail/printer.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace Cas::Detail {
@@ -394,12 +396,15 @@ bool solveLinearSystem(const Memory::Vector<Memory::Vector<Ptr>> &equations,
     if (rows == 0 || columns == 0) return false;
 
     // 输入约定：每行是增广矩阵的一行，前 columns 个是系数，第 columns 个是右端项。
+    // 系数必须是数值：含符号（如 `x*y = 6` 里 x 的系数是 y）说明方程组其实是非线性的，
+    // 按符号做消元会给出 `x = 6/y` 这种"把未知数当参数"的假解，必须拒绝。
     Memory::Vector<Memory::Vector<Ptr>> matrix = equations;
     for (auto &row : matrix) {
         if (row.size() != columns + 1) return false;
         row.resize(columns + 1);
         for (Ptr &entry : row) {
             if (!entry) entry = integer(0);
+            if (!entry->isNumber()) return false;
         }
     }
 
@@ -453,6 +458,327 @@ bool solveLinearSystem(const Memory::Vector<Memory::Vector<Ptr>> &equations,
     // 未覆盖的变量补 0（理论上不会发生，因为上面的欠定检查）
     for (std::size_t i = 0; i < columns; ++i) {
         if (!(*solution)[i]) (*solution)[i] = integer(0);
+    }
+    return true;
+}
+
+/* ------------------------------------------------ 多项式方程组（非线性） */
+
+namespace {
+
+/** @brief 分支上限：超过就停止展开，如实报告「解过多」。 */
+constexpr std::size_t kMaxBranches = 64;
+
+/** @brief 已确定的赋值（变量编号 → 值）。 */
+using Assignments = Memory::Vector<std::pair<std::uint32_t, Ptr>>;
+
+/** @brief 三角消元的递归状态。 */
+struct TriangularState {
+    Memory::Vector<Ptr> equations;         ///< 当前仍生效的 f = 0 列表
+    Memory::Vector<std::uint32_t> pending; ///< 尚未确定的变量
+    Memory::Vector<std::uint32_t> allVariables; ///< 全部变量（Groebner 变量表必须覆盖）
+    Assignments fixed;                     ///< 已确定的赋值
+    Memory::Vector<std::uint32_t> free;    ///< 判定为自由变量（消不出方程）的变量
+    Memory::Vector<SystemSolution> *out = nullptr; ///< 输出
+    bool overflow = false;                 ///< 分支数超限
+};
+
+/** @brief 多项式是否只含变量表中列出的符号，且系数为有理数。 */
+bool onlyInVariables(const Ptr &polynomial, const Memory::Vector<std::uint32_t> &variables) {
+    const Memory::Vector<std::uint32_t> free = freeSymbols(polynomial.get());
+    for (std::uint32_t symbol : free) {
+        bool allowed = false;
+        for (std::uint32_t candidate : variables) {
+            if (symbol == candidate) {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) return false;
+    }
+    // Groebner 基只在有理数域上保证终止，符号系数直接拒绝
+    MultivariatePoly check;
+    Memory::Vector<std::uint32_t> ordered = variables;
+    return toMultivariate(polynomial.get(), ordered, &check);
+}
+
+/**
+ * @brief 过滤方程列表：丢掉恒等式，遇到非零常数则报告矛盾。
+ * @return 出现矛盾（非零常数 = 0）返回 true
+ */
+bool reduceEquations(Memory::Vector<Ptr> *equations) {
+    Memory::Vector<Ptr> kept;
+    kept.reserve(equations->size());
+    for (const Ptr &equation : *equations) {
+        if (!equation) continue;
+        Ptr simplified = simplify(equation);
+        if (!simplified) continue;
+        if (simplified->isZero()) continue;      // 0 = 0：恒等式，丢弃
+        if (simplified->isNumber()) return true; // 非零常数 = 0：矛盾
+        kept.push_back(simplified);
+    }
+    *equations = kept;
+    return false;
+}
+
+/** @brief 解单变量多项式，返回去重后的所有实根。 */
+Memory::Vector<Ptr> rootsOf(const Ptr &polynomial, std::uint32_t variable) {
+    Memory::Vector<Ptr> roots;
+    UnivariatePoly poly;
+    if (!toPolynomial(polynomial.get(), variable, &poly)) return roots;
+    if (poly.isZero()) return roots;
+
+    // 一次方程允许符号系数（`y = 1 - x` 的通解形式），高次不行：
+    // `x^2 + y^2 - 1 = 0` 关于 y 的根是 ±√(1-x²)，那是分支函数而不是单个解，
+    // 贸然返回会把参数解搞成伪解。高次时只接受纯数值系数。
+    if (poly.degree() > 1) {
+        for (const Ptr &coefficient : poly.coefficients) {
+            if (!coefficient) return roots;
+            if (!coefficient->isNumber()) return roots;
+        }
+    }
+
+    for (const Solution &solution : solvePolynomial(poly, variable)) {
+        if (!solution.value) continue;
+        const std::string key = toText(solution.value.get());
+        bool duplicate = false;
+        for (const Ptr &existing : roots) {
+            if (toText(existing.get()) == key) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) roots.push_back(solution.value);
+    }
+    return roots;
+}
+
+/** @brief 从待解变量表中移除一个变量（不论它排在哪个位置）。 */
+void dropVariable(Memory::Vector<std::uint32_t> *pending, std::uint32_t variable) {
+    for (std::size_t i = 0; i < pending->size(); ++i) {
+        if ((*pending)[i] == variable) {
+            pending->erase(pending->begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
+}
+
+void solveRecursive(TriangularState &state);
+
+/**
+ * @brief 解出 `pending.back()` 这一个变量，对每个根代回后继续递归。
+ *
+ * 求该变量的方程有两个来源，按代价从低到高尝试：
+ *  1. 方程组里本来就有只含该变量的方程 → 直接求根；
+ *  2. 否则算一次 Groebner 基。该变量排在变量表**末尾**（最主元），
+ *     所以基里必然出现一个只含它的多项式——这就是消元的结果。
+ *
+ * 每得到一个根就代回其它方程：代回后出现非零常数说明这个根不满足别的方程，
+ * 直接剪枝。所以「非根」的中间值不会扩散成分支。
+ */
+void solveRecursive(TriangularState &state) {
+    if (state.overflow) return;
+
+    if (state.pending.empty()) {
+        // 变量都解完了。剩下的方程有两种可能：
+        //  1. equations 为空       —— 干净地解完整；
+        //  2. equations 非空       —— 这些方程在已求出的根上退化成 0（冗余，例如
+        //                            x+y=1 与 2x+2y=2），不代表矛盾，因为矛盾早在
+        //                            代回时被识别成非零常数并剪枝了。
+        // 两种都要产出一个分支，否则整个方程组会被误报成「无解」。
+        SystemSolution solution;
+        solution.complete = state.free.empty();
+        solution.assignments = state.fixed;
+        if (state.out->size() < kMaxBranches) {
+            state.out->push_back(solution);
+        } else {
+            state.overflow = true;
+        }
+        return;
+    }
+
+    if (state.equations.empty()) {
+        // 方程用完了但变量还有剩：参数曲面 / 欠定，如实报告
+        SystemSolution solution;
+        solution.complete = false;
+        solution.assignments = state.fixed;
+        if (state.out->size() < kMaxBranches) {
+            state.out->push_back(solution);
+        } else {
+            state.overflow = true;
+        }
+        return;
+    }
+
+    // 取 **首位** 变量来解。
+    // `pending` 的首位对应 `variables` 中最早的那个变量，也就是 Lex 消元中最先被
+    // 消净、最后才被解出的那个——此时其它变量都已代入成常数，它的系数必然不含
+    // 其它符号，单变量求根才能成功。
+    // 反过来取末位（`back()`）会先解最主元的变量，此刻其它变量还没定，
+    // 方程形如 `y = 1 - x`，系数含 x，被 `toPolynomial` 判为非常数而求根失败，
+    // 于是 `x+y=1` 这种再简单不过的方程反而报「无解」。
+    const std::uint32_t variable = state.pending.front();
+    const Memory::Vector<std::uint32_t> savedPending = state.pending;
+    const Memory::Vector<Ptr> savedEquations = state.equations;
+
+    // ---- 1. 方程组里是否已有只含该变量的方程
+    Memory::Vector<Ptr> candidates;
+    for (const Ptr &equation : savedEquations) {
+        if (onlyInVariables(equation, {variable})) {
+            candidates.push_back(equation);
+            break;
+        }
+    }
+
+    // ---- 2. 没有就用 Groebner 基消元
+    if (candidates.empty()) {
+        // 变量序的语义（实测 `compareMonomial` + Lex）：变量表**末位**最主元，
+        // 消元时被消净的是**首位**那个变量。
+        // 例：Lex `[x, y]` 对 {x^2+y^2-25, xy-12} 给出
+        //     {y^3/12 + x - 25y/12, y^4 - 25y^2 + 144}  ← 只剩 y，x 被消净。
+        // 本轮的变量要成为"剩下的那个"，所以必须排在**末位**；
+        // 排首位会被消掉，基里就找不到只含它的多项式。
+        //
+        // 变量表必须覆盖**所有**变量（state.allVariables），不能只用 pending：
+        // 方程里可能还带着已跳过、尚未代回的变量（如欠定时留下的 x），
+        // 变量表缺了它，toMultivariate 会因"未声明符号"把生成元全部丢掉，
+        // 基就成了空的，分支被误判成矛盾。
+        Memory::Vector<std::uint32_t> ordered;
+        ordered.reserve(state.allVariables.size());
+        for (std::uint32_t other : state.allVariables) {
+            if (other != variable) ordered.push_back(other);
+        }
+        ordered.push_back(variable);
+
+        // Lex 更直接给出消元结果；次数不高时计算量也可接受。
+        Memory::Vector<Ptr> basis = groebnerBasis(savedEquations, ordered, MonomialOrder::Lex);
+        if (basis.empty()) {
+            // Lex 失败（极端情况）时退回 Grevlex 再试一次
+            basis = groebnerBasis(savedEquations, ordered, MonomialOrder::Grevlex);
+        }
+        if (basis.empty()) return; // 生成理想的方程组矛盾，本分支无解
+        for (const Ptr &element : basis) {
+            if (onlyInVariables(element, {variable})) {
+                candidates.push_back(element);
+                break;
+            }
+        }
+    }
+
+    // ---- 2.5 消元不成（方程数少于未知量，基里没有只含该变量的元素）：
+    // 直接从原方程里解出该变量，留下含参表达式。
+    // 这一步是欠定方程组能给出参数解的关键：
+    // `x+y=1` 关于 x 求解得 `x = 1-y`，y 自然成为自由变量；
+    // 若在这里放弃，整组方程就会被误判成「无解」。
+    if (candidates.empty()) {
+        for (const Ptr &equation : savedEquations) {
+            UnivariatePoly poly;
+            if (!toPolynomial(equation.get(), variable, &poly)) continue;
+            if (poly.degree() != 1) continue;
+            // 首项系数为 0 时这个方程其实不含该变量，跳过
+            const Ptr leading = poly.coefficient(1);
+            if (!leading || leading->isZero()) continue;
+            candidates.push_back(equation);
+            break;
+        }
+    }
+
+    // ---- 3. 求根
+    Memory::Vector<Ptr> roots;
+    for (const Ptr &candidate : candidates) {
+        roots = rootsOf(candidate, variable);
+        if (!roots.empty()) break;
+    }
+
+    if (roots.empty()) {
+        if (candidates.empty()) {
+            // 消不出单变量方程：该变量是自由变量，先解更靠前的变量。
+            // 必须登记到 free 里，否则分支会被当成"完整解"输出，
+            // 格式化阶段就只能打印 `x = ?`。
+            dropVariable(&state.pending, variable);
+            state.free.push_back(variable);
+            solveRecursive(state);
+            state.free.pop_back();
+            state.pending = savedPending;
+        }
+        // 有候选多项式但无实根（如 y^2+1=0 只有复根）：本分支无解
+        return;
+    }
+
+    // ---- 4. 逐根代回，递归解剩下的变量
+    for (const Ptr &root : roots) {
+        if (state.overflow) return;
+
+        Memory::Vector<Ptr> next;
+        bool contradiction = false;
+        for (const Ptr &equation : savedEquations) {
+            // 先展开再化简：代回符号根（如 x = 1-y）会得到 `y-(y-1)-1` 这类
+            // 结构上还没合并的式子，只 simplify 不够，会残留一个恒等式，
+            // 后续把它当真实约束去求根，分支就再也走不下去。
+            Ptr substituted = simplify(expand(substitute(equation, variable, root)));
+            if (!substituted) {
+                contradiction = true;
+                break;
+            }
+            if (substituted->isZero()) continue;
+            if (substituted->isNumber()) {
+                contradiction = true; // 这个根不满足别的方程
+                break;
+            }
+            next.push_back(substituted);
+        }
+        if (contradiction) continue;
+
+        state.equations = next;
+        state.pending = savedPending;
+        dropVariable(&state.pending, variable);
+        state.fixed.push_back({variable, root});
+        solveRecursive(state);
+        state.fixed.pop_back();
+    }
+
+    // 恢复状态，供上层（或下一个根）使用
+    state.equations = savedEquations;
+    state.pending = savedPending;
+}
+
+} // namespace
+
+bool solveSystemNonlinear(const Memory::Vector<Ptr> &polynomials, const Memory::Vector<std::uint32_t> &variables,
+                          Memory::Vector<SystemSolution> *solutions) {
+    solutions->clear();
+    if (polynomials.empty() || variables.empty()) return false;
+
+    // 规范化输入：展开、确认是有理系数多项式
+    Memory::Vector<Ptr> equations;
+    equations.reserve(polynomials.size());
+    for (const Ptr &polynomial : polynomials) {
+        if (!polynomial) continue;
+        Ptr expanded = expand(polynomial);
+        if (!expanded) return false;
+        if (!onlyInVariables(expanded, variables)) return false;
+        equations.push_back(expanded);
+    }
+
+    if (reduceEquations(&equations)) return true; // 矛盾：无解，正常返回空表
+    if (equations.empty()) {
+        // 全是恒等式：任意取值都是解
+        SystemSolution solution;
+        solution.complete = false;
+        solutions->push_back(solution);
+        return true;
+    }
+
+    TriangularState state;
+    state.equations = equations;
+    state.pending = variables;
+    state.allVariables = variables;
+    state.out = solutions;
+    solveRecursive(state);
+
+    if (state.overflow) {
+        solutions->clear();
+        return false;
     }
     return true;
 }
